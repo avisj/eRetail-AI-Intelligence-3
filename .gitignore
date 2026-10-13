@@ -1,0 +1,33 @@
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Heavy raw datasets & compiled binaries
+raw_sales_data/
+sku_master2.csv
+*.parquet
+*.tar.gz
+*.dylib
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Task logs & scratch artifacts
+.system_generated/
+scratch/
