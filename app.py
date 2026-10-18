@@ -5,6 +5,7 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import scipy.stats as stats
 import streamlit as st
 from timesfm3.mlx import TimesFM3Forecaster
 import xgboost as xgb
@@ -20,7 +21,7 @@ st.set_page_config(
 st.title("Enterprise Demand Intelligence Workspace")
 st.caption(
     "AI-powered multi-model time-series forecasting, financial projections, and "
-    "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and Croston Intermittent."
+    "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and Croston/SBA Intermittent Demand."
 )
 
 # ==============================================================================
@@ -133,6 +134,47 @@ def load_and_compile_data() -> pd.DataFrame:
 compiled_df = load_and_compile_data()
 
 # ==============================================================================
+# 2. Multi-Criteria ABC/XYZ SKU Classification Engine (@st.cache_data)
+# ==============================================================================
+@st.cache_data
+def compute_abc_classification(df: pd.DataFrame) -> dict:
+    """
+    Computes Pareto ranking using BOTH Total Revenue and Total Unit Volume:
+      - Class A: SKUs in the top 80% cumulative revenue OR top 80% cumulative unit volume.
+      - Class B: SKUs in the next 15% cumulative revenue OR top 95% cumulative volume.
+      - Class C: SKUs in the bottom 5% of both revenue and volume.
+    Returns a dictionary mapping sku -> class string.
+    """
+    sku_stats = df.groupby("sku", as_index=False).agg({"revenue": "sum", "sales": "sum"})
+    tot_rev = float(sku_stats["revenue"].sum())
+    tot_vol = float(sku_stats["sales"].sum())
+
+    if tot_rev <= 0 or tot_vol <= 0:
+        return {s: "Class B" for s in sku_stats["sku"]}
+
+    # Revenue Pareto rank
+    sku_stats = sku_stats.sort_values(by="revenue", ascending=False)
+    sku_stats["cum_rev"] = sku_stats["revenue"].cumsum() / tot_rev
+
+    # Volume Pareto rank
+    sku_stats = sku_stats.sort_values(by="sales", ascending=False)
+    sku_stats["cum_vol"] = sku_stats["sales"].cumsum() / tot_vol
+
+    def assign_multi_criteria_class(row) -> str:
+        if row["cum_rev"] <= 0.80 or row["cum_vol"] <= 0.80:
+            return "Class A"
+        elif row["cum_rev"] <= 0.95 or row["cum_vol"] <= 0.95:
+            return "Class B"
+        else:
+            return "Class C"
+
+    sku_stats["sku_class"] = sku_stats.apply(assign_multi_criteria_class, axis=1)
+    return dict(zip(sku_stats["sku"], sku_stats["sku_class"]))
+
+sku_class_map = compute_abc_classification(compiled_df)
+compiled_df["sku_class"] = compiled_df["sku"].map(sku_class_map).fillna("Class B")
+
+# ==============================================================================
 # Model Loader (@st.cache_resource)
 # ==============================================================================
 @st.cache_resource(show_spinner="Initializing TimesFM 3.0 foundation model...")
@@ -152,8 +194,8 @@ def train_and_forecast_xgboost(
     """
     Trains an XGBoost Regressor (n_estimators=50, max_depth=4, learning_rate=0.08, random_state=42, n_jobs=1)
     using engineered features ('month', 'is_weekend') along with autoregressive lags
-    (1-day lag, 7-day lag, 14-day lag, weekly rolling average, bi-weekly rolling average).
-    Implements a recursive loop to forecast step-by-step into the target horizon.
+    (1-step lag, 7-step lag, 14-step lag, short rolling average, long rolling average).
+    Implements a recursive multi-step forecasting loop.
     """
     df_sorted = context_df.sort_values("date").reset_index(drop=True)
     vals = df_sorted[target_col].values.astype(np.float32)
@@ -168,13 +210,13 @@ def train_and_forecast_xgboost(
     for i in range(14, n):
         row_date = df_sorted["date"].iloc[i]
         feat = [
-            row_date.month,                                # month
-            int(row_date.dayofweek in [5, 6]),             # is_weekend
-            float(vals[i - 1]),                            # 1-day lag
-            float(vals[i - 7]),                            # 7-day lag
-            float(vals[i - 14]),                           # 14-day lag
-            float(np.mean(vals[i - 7:i])),                 # weekly rolling average (7d)
-            float(np.mean(vals[i - 14:i]))                 # bi-weekly rolling average (14d)
+            row_date.month,
+            int(row_date.dayofweek in [5, 6]),
+            float(vals[i - 1]),
+            float(vals[i - 7]),
+            float(vals[i - 14]),
+            float(np.mean(vals[i - 7:i])),
+            float(np.mean(vals[i - 14:i]))
         ]
         X_list.append(feat)
         y_list.append(vals[i])
@@ -191,7 +233,6 @@ def train_and_forecast_xgboost(
     )
     reg.fit(X_train, y_train)
 
-    # Recursive multi-step generation loop into target horizon
     curr_history = list(vals)
     predictions = []
     for f_date in future_dates:
@@ -213,14 +254,36 @@ def train_and_forecast_xgboost(
     return np.array(predictions, dtype=np.float32)
 
 
-def croston_forecast(series: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarray:
+def check_discontinued(series: np.ndarray, threshold_days: int = 60) -> bool:
     """
-    Traditional Croston Intermittent Demand calculation loop to map a flat sparse inventory baseline.
-    Separates demand into non-zero demand magnitude (z) and inter-arrival intervals (p).
+    Zero-demand check: returns True if SKU registered 0 sales for >= threshold_days
+    consecutive periods immediately preceding the forecast start date.
     """
+    non_zeros = np.where(series > 0)[0]
+    if len(non_zeros) == 0:
+        return True
+    trailing_zeros = len(series) - 1 - non_zeros[-1]
+    return trailing_zeros >= threshold_days
+
+
+def sba_croston_forecast(
+    series: np.ndarray,
+    horizon: int,
+    alpha: float = 0.1,
+    is_discontinued: bool = False
+) -> tuple:
+    """
+    Syntetos-Boylan Approximation (SBA) with Zero-Demand Truncation:
+    - Zero-Demand Truncation: If SKU is marked discontinued, sets baseline forecast to 0.0.
+    - SBA Bias Correction: Forecast_SBA = (1.0 - alpha / 2.0) * Forecast_Croston.
+    Returns: (forecast_array, sba_rate, demand_std)
+    """
+    if is_discontinued:
+        return np.zeros(horizon, dtype=np.float32), 0.0, 0.0
+
     non_zero = np.where(series > 0)[0]
     if len(non_zero) == 0:
-        return np.zeros(horizon, dtype=np.float32)
+        return np.zeros(horizon, dtype=np.float32), 0.0, 0.0
 
     z = float(series[non_zero[0]])
     p = float(non_zero[1] - non_zero[0]) if len(non_zero) > 1 else 1.0
@@ -235,11 +298,43 @@ def croston_forecast(series: np.ndarray, horizon: int, alpha: float = 0.1) -> np
             last_t = t
 
     p = max(p, 1.0)
-    rate = max(0.0, z / p)
-    return np.full(horizon, rate, dtype=np.float32)
+    croston_rate = max(0.0, z / p)
+    sba_rate = (1.0 - (alpha / 2.0)) * croston_rate
+
+    demand_std = float(np.std(series[non_zero]) if len(non_zero) > 1 else series[non_zero[0]])
+    return np.full(horizon, sba_rate, dtype=np.float32), sba_rate, demand_std
+
+
+def compute_safety_stock_rop(
+    rate: float,
+    demand_std: float,
+    confidence_interval: float,
+    lead_time_days: int = 14,
+    is_discontinued: bool = False,
+    is_weekly: bool = False
+) -> tuple:
+    """
+    Computes Recommended Safety Stock Buffer and Reorder Point (ROP).
+    Z is derived from confidence interval using normal distribution quantile.
+    """
+    if is_discontinued or rate <= 0:
+        return 0, 0
+
+    z = float(stats.norm.ppf(confidence_interval / 100.0))
+    if is_weekly:
+        daily_rate = rate / 7.0
+        sigma_daily = demand_std / np.sqrt(7.0)
+    else:
+        daily_rate = rate
+        sigma_daily = demand_std
+
+    sigma_lead_time = sigma_daily * np.sqrt(lead_time_days)
+    safety_stock = int(np.ceil(max(0.0, z * sigma_lead_time)))
+    rop = int(np.ceil((daily_rate * lead_time_days) + safety_stock))
+    return safety_stock, rop
 
 # ==============================================================================
-# UI Control Panel: Sidebar
+# UI Control Panel: Sidebar (Hierarchical Drill-Down with Class Filter & ALL Defaults)
 # ==============================================================================
 st.sidebar.subheader("Configuration Panel")
 
@@ -260,19 +355,33 @@ dashboard_mode = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.subheader("Catalog Hierarchy Filters")
 
-# Cascading Filter 1: Brand
-brands_available = ["All"] + sorted(compiled_df["brand"].dropna().unique().tolist())
-selected_brand = st.sidebar.selectbox("Brand Filter", brands_available)
+# Cascading Filter 0: SKU Class Filter (Default "ALL")
+class_options = ["ALL", "Class A", "Class B", "Class C"]
+selected_class = st.sidebar.selectbox(
+    "SKU Class Filter",
+    class_options,
+    index=0,
+    help="Pareto segmentation tier: Class A (Top 80% Rev/Vol), Class B (Next 15%), Class C (Intermittent)."
+)
 
-# Cascading Filter 2: Category
-if selected_brand == "All":
-    cat_df = compiled_df
+if selected_class == "ALL":
+    class_filtered_df = compiled_df
 else:
-    cat_df = compiled_df[compiled_df["brand"] == selected_brand]
-categories_available = ["All"] + sorted(cat_df["category"].dropna().unique().tolist())
-selected_category = st.sidebar.selectbox("Category Filter", categories_available)
+    class_filtered_df = compiled_df[compiled_df["sku_class"] == selected_class]
 
-# Cascading Filter 3: SKU
+# Cascading Filter 1: Brand (Default "All")
+brands_available = ["All"] + sorted(class_filtered_df["brand"].dropna().unique().tolist())
+selected_brand = st.sidebar.selectbox("Brand Filter", brands_available, index=0)
+
+# Cascading Filter 2: Category (Default "All")
+if selected_brand == "All":
+    cat_df = class_filtered_df
+else:
+    cat_df = class_filtered_df[class_filtered_df["brand"] == selected_brand]
+categories_available = ["All"] + sorted(cat_df["category"].dropna().unique().tolist())
+selected_category = st.sidebar.selectbox("Category Filter", categories_available, index=0)
+
+# Cascading Filter 3: SKU (Default "All")
 if selected_category == "All":
     sku_df = cat_df
 else:
@@ -283,15 +392,21 @@ if not top_skus:
     st.warning("No SKU inventory records match the selected hierarchy.")
     st.stop()
 
+sku_options = ["All"] + top_skus
 sku_desc_map = dict(zip(sku_df["sku"], sku_df.get("SKU_Description", sku_df["sku"])))
 
 def format_sku_label(sku_id: str) -> str:
+    if sku_id == "All":
+        if selected_class != "ALL":
+            return f"All {selected_class} SKUs ({len(top_skus):,} items) - {selected_class} Aggregate"
+        return f"All SKUs ({len(top_skus):,} items) - Portfolio Aggregate"
     desc = str(sku_desc_map.get(sku_id, "") or "")
+    cls_tag = sku_class_map.get(sku_id, "Class B")
     if desc and desc != "nan" and desc != sku_id:
-        return f"{sku_id} - {desc[:35]}"
-    return str(sku_id)
+        return f"[{cls_tag}] {sku_id} - {desc[:30]}"
+    return f"[{cls_tag}] {sku_id}"
 
-selected_sku = st.sidebar.selectbox("Active SKU Segment", top_skus, format_func=format_sku_label)
+selected_sku = st.sidebar.selectbox("Active SKU Segment", sku_options, index=0, format_func=format_sku_label)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Horizon Calibration")
@@ -320,22 +435,47 @@ confidence_interval = st.sidebar.slider(
     max_value=95,
     value=80,
     step=5,
-    help="Quantile interval band for uncertainty bounds."
+    help="Quantile interval band for uncertainty bounds and inventory safety stock."
 )
 
 # ==============================================================================
-# Data Preparation & Pricing Scaling
+# Data Preparation, Hierarchical Aggregation, and ABC Smart Strategy
 # ==============================================================================
-active_sku_data = compiled_df[compiled_df["sku"] == selected_sku]
+if selected_sku == "All":
+    active_sku_data = sku_df
+    sku_class = f"{selected_class} Aggregate" if selected_class != "ALL" else "Portfolio Aggregate"
+    sku_brand = selected_brand if selected_brand != "All" else "All Brands"
+    sku_cat = selected_category if selected_category != "All" else "All Categories"
+    sku_desc = f"Consolidated {selected_class if selected_class != 'ALL' else 'Portfolio'} ({len(top_skus):,} Active SKUs)"
+    
+    # Dynamic sum across all SKUs in filtered dataset
+    sku_daily = (
+        active_sku_data.groupby("date")[["sales", "revenue"]]
+        .sum()
+        .reset_index()
+        .sort_values("date")
+    )
+    tot_vol = float(sku_daily["sales"].sum())
+    active_price = float(sku_daily["revenue"].sum() / tot_vol) if tot_vol > 0 else 799.0
+    sku_daily["price"] = active_price
+else:
+    active_sku_data = sku_df[sku_df["sku"] == selected_sku]
+    sku_class = sku_class_map.get(selected_sku, "Class B")
+    meta_row = active_sku_data.iloc[0]
+    sku_brand = meta_row.get("brand", "The Souled Store")
+    sku_cat = meta_row.get("category", "General")
+    sku_desc = meta_row.get("SKU_Description", selected_sku)
+    active_price = float(meta_row.get("price", 799.0))
+    
+    sku_daily = (
+        active_sku_data.groupby("date")[["sales", "revenue"]]
+        .sum()
+        .reset_index()
+        .sort_values("date")
+    )
+    sku_daily["price"] = active_price
 
-sku_daily = (
-    active_sku_data.groupby("date")[["sales", "price", "month", "is_weekend"]]
-    .agg({"sales": "sum", "price": "first", "month": "first", "is_weekend": "first"})
-    .reset_index()
-    .sort_values("date")
-)
-
-# Reindex across complete daily calendar range to ensure zero gaps
+# Full timeline daily zero-fill
 full_timeline = pd.date_range(start=sku_daily["date"].min(), end=sku_daily["date"].max(), freq="D")
 sku_daily = (
     sku_daily.set_index("date")
@@ -344,17 +484,76 @@ sku_daily = (
     .reset_index()
 )
 sku_daily["sales"] = sku_daily["sales"].fillna(0.0)
+sku_daily["revenue"] = sku_daily["revenue"].fillna(0.0)
+sku_daily["price"] = sku_daily["price"].fillna(active_price)
 sku_daily["month"] = sku_daily["date"].dt.month
 sku_daily["is_weekend"] = sku_daily["date"].dt.dayofweek.isin([5, 6]).astype(int)
 
-# Extract SKU Metadata & active unit price
-meta_row = active_sku_data.iloc[0]
-sku_brand = meta_row.get("brand", "The Souled Store")
-sku_cat = meta_row.get("category", "General")
-sku_desc = meta_row.get("SKU_Description", selected_sku)
-active_price = float(meta_row.get("price", 799.0))
-sku_daily["price"] = active_price
-sku_daily["revenue"] = sku_daily["sales"] * active_price
+# Check zero-demand truncation status for individual Class C items
+is_class_c = (selected_sku != "All" and sku_class == "Class C")
+is_discontinued = False
+
+if is_class_c:
+    if dashboard_mode == "Historical Validation (Backtesting)":
+        pre_cutoff_series = sku_daily[sku_daily["date"] <= pd.to_datetime(cutoff_date_str)]["sales"].values
+        is_discontinued = check_discontinued(pre_cutoff_series, threshold_days=60)
+    else:
+        is_discontinued = check_discontinued(sku_daily["sales"].values, threshold_days=60)
+
+# -----------------------------------------------------------------------------
+# Smart Forecasting Strategy & Visual Classification Badge
+# -----------------------------------------------------------------------------
+if selected_sku == "All":
+    badge_html = (
+        '<span style="background-color: #1e3a8a; color: #ffffff; padding: 3px 9px; '
+        'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
+        f'{sku_class}</span>'
+    )
+elif is_discontinued:
+    badge_html = (
+        '<span style="background-color: #64748b; color: #ffffff; padding: 3px 9px; '
+        'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
+        'Class C - Inactive / Discontinued</span>'
+    )
+elif sku_class == "Class A":
+    badge_html = (
+        '<span style="background-color: #166534; color: #ffffff; padding: 3px 9px; '
+        'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
+        'Class A - High Volume / Revenue</span>'
+    )
+elif sku_class == "Class B":
+    badge_html = (
+        '<span style="background-color: #b45309; color: #ffffff; padding: 3px 9px; '
+        'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
+        'Class B - Steady Volume</span>'
+    )
+else:
+    badge_html = (
+        '<span style="background-color: #991b1b; color: #ffffff; padding: 3px 9px; '
+        'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
+        'Class C - Intermittent</span>'
+    )
+
+st.markdown(f"**Active Selection:** `{selected_sku}` {badge_html}", unsafe_allow_html=True)
+
+# Smart Resampling: If individual Class C SKU is selected, resample to weekly sum
+if is_class_c:
+    st.info(
+        "This item has sparse/intermittent demand. Showing weekly aggregated trend for higher accuracy. "
+        "Syntetos-Boylan Approximation (SBA) and safety stock buffer safeguards active."
+    )
+    sku_series = (
+        sku_daily.set_index("date")
+        .resample("W-SUN")
+        .agg({"sales": "sum", "revenue": "sum", "price": "first"})
+        .reset_index()
+    )
+    sku_series["month"] = sku_series["date"].dt.month
+    sku_series["is_weekend"] = 0
+    time_grain_label = "Weekly"
+else:
+    sku_series = sku_daily
+    time_grain_label = "Daily"
 
 # Target column and display formatting based on View Mode
 target_col = "revenue" if view_mode == "Expected Revenue" else "sales"
@@ -363,9 +562,9 @@ unit_suffix = "" if view_mode == "Expected Revenue" else " units"
 
 # TimesFM decile quantiles [0.1, 0.2, ..., 0.9]
 deciles = np.linspace(0.1, 0.9, 9)
-alpha = (100.0 - confidence_interval) / 200.0
-low_idx = int(np.clip(np.argmin(np.abs(deciles - alpha)), 0, 8))
-high_idx = int(np.clip(np.argmin(np.abs(deciles - (1.0 - alpha))), 0, 8))
+alpha_ci = (100.0 - confidence_interval) / 200.0
+low_idx = int(np.clip(np.argmin(np.abs(deciles - alpha_ci)), 0, 8))
+high_idx = int(np.clip(np.argmin(np.abs(deciles - (1.0 - alpha_ci))), 0, 8))
 
 # ==============================================================================
 # Model Execution Engine
@@ -374,27 +573,38 @@ if dashboard_mode == "Live Future Forecast":
     # -------------------------------------------------------------------------
     # Mode A: Live Future Forecast
     # -------------------------------------------------------------------------
-    historical_array = sku_daily[target_col].values.astype(np.float32)
-    historical_dates = sku_daily["date"].values
+    historical_array = sku_series[target_col].values.astype(np.float32)
+    historical_dates = sku_series["date"].values
     last_hist_date = pd.to_datetime(historical_dates[-1])
-    future_dates = [last_hist_date + datetime.timedelta(days=i) for i in range(1, horizon_days + 1)]
 
-    with st.spinner(f"Computing multi-model projections for {horizon_days} future days..."):
+    if is_class_c:
+        horizon_steps = max(2, int(np.ceil(horizon_days / 7.0)))
+        future_dates = [last_hist_date + datetime.timedelta(weeks=i) for i in range(1, horizon_steps + 1)]
+    else:
+        horizon_steps = horizon_days
+        future_dates = [last_hist_date + datetime.timedelta(days=i) for i in range(1, horizon_steps + 1)]
+
+    with st.spinner(f"Computing multi-model projections for {horizon_steps} {time_grain_label.lower()} steps..."):
         # 1. TimesFM 3.0 MLX Native Inference
-        tfm_out = timesfm_model.predict(historical_array, horizon=horizon_days, return_quantiles=True)
+        tfm_out = timesfm_model.predict(historical_array, horizon=horizon_steps, return_quantiles=True)
         timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
         quantiles_matrix = np.asarray(tfm_out.quantiles, dtype=np.float32)
         tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
         tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
         # 2. XGBoost Multivariate Regressor
-        xgb_pred = train_and_forecast_xgboost(sku_daily, target_col, future_dates)
+        xgb_pred = train_and_forecast_xgboost(sku_series, target_col, future_dates)
 
-        # 3. Croston Intermittent Baseline
-        croston_pred = croston_forecast(historical_array, horizon=horizon_days)
+        # 3. SBA Croston Intermittent with Zero-Demand Truncation
+        croston_pred, sba_rate, demand_std = sba_croston_forecast(
+            historical_array,
+            horizon=horizon_steps,
+            alpha=0.1,
+            is_discontinued=is_discontinued
+        )
 
     # Primary Metric Summary Widgets inside Container Layout
-    tot_sales_baseline = float(np.sum(sku_daily["sales"].values))
+    tot_sales_baseline = float(np.sum(sku_series["sales"].values))
     tot_revenue_proj = float(np.sum(timesfm_pred if view_mode == "Expected Revenue" else timesfm_pred * active_price))
     tot_tfm = float(np.sum(timesfm_pred))
     tot_xgb = float(np.sum(xgb_pred))
@@ -403,8 +613,31 @@ if dashboard_mode == "Live Future Forecast":
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
         m2.metric("Projected Revenue Matrix", f"₹{tot_revenue_proj:,.0f}")
-        m3.metric("TimesFM Projected Trajectory", f"{curr_symbol}{tot_tfm:,.0f}{unit_suffix}")
-        m4.metric("XGBoost Projected Trajectory", f"{curr_symbol}{tot_xgb:,.0f}{unit_suffix}")
+        m3.metric(f"TimesFM Projected ({time_grain_label})", f"{curr_symbol}{tot_tfm:,.0f}{unit_suffix}")
+        m4.metric(f"XGBoost Projected ({time_grain_label})", f"{curr_symbol}{tot_xgb:,.0f}{unit_suffix}")
+
+    # Class C Safety Stock and Reorder Point (ROP) Safeguard Card
+    if is_class_c:
+        unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
+        unit_std = demand_std if view_mode == "Sales Units" else (demand_std / active_price if active_price > 0 else 0.0)
+        safety_stock, rop = compute_safety_stock_rop(
+            rate=unit_rate,
+            demand_std=unit_std,
+            confidence_interval=confidence_interval,
+            lead_time_days=14,
+            is_discontinued=is_discontinued,
+            is_weekly=True
+        )
+        with st.container(border=True):
+            st.markdown("**Intermittent Demand Safeguards: Safety Stock & Reorder Point (ROP)**")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Reorder Point (ROP)", f"{rop:,} units" if not is_discontinued else "0 units (Discontinued)")
+            c2.metric("Safety Stock Buffer", f"{safety_stock:,} units" if not is_discontinued else "0 units (Discontinued)")
+            c3.metric("Lead Time Parameter", "14 Calendar Days")
+            c4.metric(
+                "Lifecycle Demand Status",
+                "Inactive / Discontinued" if is_discontinued else "Active Intermittent Demand"
+            )
 
 else:
     # -------------------------------------------------------------------------
@@ -413,8 +646,8 @@ else:
     cutoff_dt = pd.to_datetime(cutoff_date_str)
     validation_end_dt = pd.to_datetime("2025-12-31")
 
-    context_df = sku_daily[sku_daily["date"] <= cutoff_dt]
-    truth_df = sku_daily[(sku_daily["date"] > cutoff_dt) & (sku_daily["date"] <= validation_end_dt)]
+    context_df = sku_series[sku_series["date"] <= cutoff_dt]
+    truth_df = sku_series[(sku_series["date"] > cutoff_dt) & (sku_series["date"] <= validation_end_dt)]
 
     if context_df.empty or truth_df.empty:
         st.error(f"Insufficient split data for cutoff date {cutoff_date_str}.")
@@ -427,7 +660,7 @@ else:
 
     dynamic_horizon = len(truth_df)
 
-    with st.spinner(f"Executing validation benchmark across {dynamic_horizon} ground-truth days..."):
+    with st.spinner(f"Executing validation benchmark across {dynamic_horizon} {time_grain_label.lower()} steps..."):
         # 1. TimesFM 3.0 MLX Native Inference
         tfm_out = timesfm_model.predict(context_array, horizon=dynamic_horizon, return_quantiles=True)
         timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
@@ -438,10 +671,15 @@ else:
         # 2. XGBoost Multivariate Regressor
         xgb_pred = train_and_forecast_xgboost(context_df, target_col, list(truth_df["date"]))
 
-        # 3. Croston Intermittent Baseline
-        croston_pred = croston_forecast(context_array, horizon=dynamic_horizon)
+        # 3. SBA Croston Intermittent with Zero-Demand Truncation
+        croston_pred, sba_rate, demand_std = sba_croston_forecast(
+            context_array,
+            horizon=dynamic_horizon,
+            alpha=0.1,
+            is_discontinued=is_discontinued
+        )
 
-    # Compute Validation Benchmark Metrics
+    # Compute Validation Benchmark Metrics dynamically on aggregated totals
     sum_truth = float(max(np.sum(truth_array), 1.0))
 
     def evaluate_model(preds: np.ndarray):
@@ -467,6 +705,29 @@ else:
         m3.metric("TimesFM Validation Accuracy", f"{tfm_acc:.1f}%")
         m4.metric("TimesFM Error Margin (WAPE)", f"{tfm_wape * 100:.1f}%")
 
+    # Class C Safety Stock and Reorder Point (ROP) Safeguard Card
+    if is_class_c:
+        unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
+        unit_std = demand_std if view_mode == "Sales Units" else (demand_std / active_price if active_price > 0 else 0.0)
+        safety_stock, rop = compute_safety_stock_rop(
+            rate=unit_rate,
+            demand_std=unit_std,
+            confidence_interval=confidence_interval,
+            lead_time_days=14,
+            is_discontinued=is_discontinued,
+            is_weekly=True
+        )
+        with st.container(border=True):
+            st.markdown("**Intermittent Demand Safeguards: Safety Stock & Reorder Point (ROP)**")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Reorder Point (ROP)", f"{rop:,} units" if not is_discontinued else "0 units (Discontinued)")
+            c2.metric("Safety Stock Buffer", f"{safety_stock:,} units" if not is_discontinued else "0 units (Discontinued)")
+            c3.metric("Lead Time Parameter", "14 Calendar Days")
+            c4.metric(
+                "Lifecycle Demand Status",
+                "Inactive / Discontinued (>= 60 Days Zero Demand)" if is_discontinued else "Active Intermittent Demand"
+            )
+
     # Historical Validation & Model Performance Matrix
     st.subheader(f"Historical Validation & Model Performance Matrix ({cutoff_date_str} to 2025-12-31)")
 
@@ -488,7 +749,7 @@ else:
             "Actual Ground Truth Sum": f"{curr_symbol}{sum_truth:,.0f}{unit_suffix}"
         },
         {
-            "Model Architecture": "Croston Method (Intermittent Baseline)",
+            "Model Architecture": "SBA Croston (Intermittent Baseline)",
             "Prediction Accuracy": f"{crs_acc:.1f}%",
             "WAPE (Error Margin)": f"{crs_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{crs_mae:,.1f}{unit_suffix}",
@@ -498,12 +759,74 @@ else:
     ]
     st.table(pd.DataFrame(benchmark_data))
 
+    # Enterprise Accuracy Benchmark Breakdown by SKU Segment Class
+    st.subheader("Accuracy Benchmark Breakdown by SKU Segment Class")
+    st.caption("Class-level macroeconomic backtesting benchmarks across the portfolio (Validation Period to 2025-12-31):")
+
+    @st.cache_data(show_spinner=False)
+    def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame:
+        c_dt = pd.to_datetime(cutoff_date)
+        v_dt = pd.to_datetime("2025-12-31")
+        col = "revenue" if metric_mode == "Expected Revenue" else "sales"
+        sym = "₹" if metric_mode == "Expected Revenue" else ""
+        sfx = "" if metric_mode == "Expected Revenue" else " units"
+
+        configs = [
+            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX)", "Daily", "Dynamic Neural Prediction & Automated Replenishment"),
+            ("Class B Segment", "Class B", "Google TimesFM 3.0 / XGBoost Hybrid", "Daily", "Multivariate Trend Tracking & Periodic Order Cycles"),
+            ("Class C Segment", "Class C", "SBA Intermittent Method (Weekly)", "Weekly", "Safety Stock Buffer & Reorder Point (ROP) Safeguards")
+        ]
+        out_rows = []
+        for label, cls, engine, res, strat in configs:
+            sub = compiled_df[compiled_df["sku_class"] == cls].groupby("date")[[col]].sum().reset_index().sort_values("date")
+            f_timeline = pd.date_range(sub["date"].min(), sub["date"].max(), freq="D")
+            sub = sub.set_index("date").reindex(f_timeline).rename_axis("date").reset_index()
+            sub[col] = sub[col].fillna(0.0)
+
+            if res == "Weekly":
+                sub = sub.set_index("date").resample("W-SUN").sum().reset_index()
+
+            c_df = sub[sub["date"] <= c_dt]
+            t_df = sub[(sub["date"] > c_dt) & (sub["date"] <= v_dt)]
+            if c_df.empty or t_df.empty:
+                continue
+
+            c_vals = c_df[col].values.astype(np.float32)
+            t_vals = t_df[col].values.astype(np.float32)
+            h_len = len(t_vals)
+            s_truth = float(max(np.sum(t_vals), 1.0))
+
+            if cls in ["Class A", "Class B"]:
+                m_out = timesfm_model.predict(c_vals, horizon=h_len)
+                p_vals = np.asarray(m_out.forecast, dtype=np.float32)
+            else:
+                p_vals, _, _ = sba_croston_forecast(c_vals, horizon=h_len, alpha=0.1)
+
+            err = np.abs(t_vals - p_vals)
+            mae_m = float(np.mean(err))
+            wape_m = float(np.sum(err) / s_truth)
+            acc_m = float(max(0.0, (1.0 - wape_m) * 100.0))
+
+            out_rows.append({
+                "SKU Segment Class": label,
+                "Forecasting Engine": engine,
+                "Resolution": res,
+                "Validation Accuracy": f"{acc_m:.1f}%",
+                "WAPE (Error Margin)": f"{wape_m * 100:.1f}%",
+                "MAE": f"{sym}{mae_m:,.1f}{sfx}",
+                "Recommended Inventory Strategy": strat
+            })
+        return pd.DataFrame(out_rows)
+
+    class_benchmark_df = compute_class_benchmarks(cutoff_date_str, view_mode)
+    st.table(class_benchmark_df)
+
 st.markdown("---")
 
 # ==============================================================================
 # Complete Plotly Interactivity (go.Figure)
 # ==============================================================================
-st.subheader("Interactive Multi-Model Timeline Graph")
+st.subheader(f"Interactive Multi-Model Timeline Graph ({time_grain_label} Resolution)")
 
 fig = go.Figure()
 num_fmt = ":,.1f" if view_mode == "Expected Revenue" else ":,.1f"
@@ -570,14 +893,14 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 5. Croston Intermittent (Dashed Red)
+    # 5. Croston / SBA Intermittent (Dashed Red)
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=croston_pred,
         mode="lines",
-        name="Croston Intermittent",
+        name="SBA Croston Intermittent",
         line=dict(color="#d62728", width=2.0, dash="dashdot"),
-        hovertemplate=f"<b>Croston Intermittent</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
+        hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     # Cutoff Vertical Marker
@@ -591,8 +914,8 @@ if dashboard_mode == "Historical Validation (Backtesting)":
     )
 
     chart_title = (
-        f"Validation Benchmark: SKU {selected_sku} | {sku_desc[:35]} "
-        f"({view_mode}) | Split Date: {cutoff_date_str}"
+        f"Validation Benchmark: {selected_sku} | {sku_desc[:35]} "
+        f"({view_mode}) | Split Date: {cutoff_date_str} [{time_grain_label}]"
     )
 
 else:
@@ -657,14 +980,14 @@ else:
         hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 4. Croston Intermittent (Dashed Red)
+    # 4. Croston / SBA Intermittent (Dashed Red)
     fig.add_trace(go.Scatter(
         x=conn_dates,
         y=conn_crs,
         mode="lines",
-        name="Croston Intermittent",
+        name="SBA Croston Intermittent",
         line=dict(color="#d62728", width=2.0, dash="dashdot"),
-        hovertemplate=f"<b>Croston Intermittent</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
+        hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     # Forecast Horizon Start Vertical Marker
@@ -678,8 +1001,8 @@ else:
     )
 
     chart_title = (
-        f"Live Demand Projection ({horizon_days}-Day Horizon): "
-        f"SKU {selected_sku} | {sku_desc[:35]} ({view_mode})"
+        f"Live Demand Projection ({horizon_steps} {time_grain_label} Steps): "
+        f"{selected_sku} | {sku_desc[:35]} ({view_mode})"
     )
 
 # Layout: Native Pan/Zoom, Synchronized Hover Cursor, and Range Slider
@@ -719,13 +1042,14 @@ if dashboard_mode == "Historical Validation (Backtesting)":
     export_df = pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in truth_df["date"]],
         "sku": selected_sku,
+        "sku_classification": sku_class,
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
         f"actual_{target_col}": np.round(truth_array, 1),
         f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
         f"xgboost_{target_col}": np.round(xgb_pred, 1),
-        f"croston_{target_col}": np.round(croston_pred, 1),
+        f"sba_croston_{target_col}": np.round(croston_pred, 1),
         "timesfm3_lower_bound": np.round(tfm_lower, 1),
         "timesfm3_upper_bound": np.round(tfm_upper, 1),
         "confidence_level": f"{confidence_interval}%"
@@ -735,17 +1059,18 @@ else:
     export_df = pd.DataFrame({
         "date": [d.strftime("%Y-%m-%d") for d in future_dates],
         "sku": selected_sku,
+        "sku_classification": sku_class,
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
         f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
         f"xgboost_{target_col}": np.round(xgb_pred, 1),
-        f"croston_{target_col}": np.round(croston_pred, 1),
+        f"sba_croston_{target_col}": np.round(croston_pred, 1),
         "timesfm3_lower_bound": np.round(tfm_lower, 1),
         "timesfm3_upper_bound": np.round(tfm_upper, 1),
         "confidence_level": f"{confidence_interval}%"
     })
-    filename = f"forecast_matrix_{selected_sku}_{horizon_days}d_{target_col}.csv"
+    filename = f"forecast_matrix_{selected_sku}_{horizon_steps}_{target_col}.csv"
 
 csv_buffer = io.StringIO()
 export_df.to_csv(csv_buffer, index=False)
