@@ -25,81 +25,96 @@ st.caption(
 )
 
 # ==============================================================================
-# 1. Dual Promotional Covariate Engine: Peak Event & Pre-Event Flags (2023 - 2025)
+# 1. Weighted Promotional Magnitude Covariates Engine (2023 - 2025)
 # ==============================================================================
-PEAK_EVENT_RANGES = [
-    # 1. Republic Day Sale Peak (exact 5-7 days)
-    ("2023-01-20", "2023-01-26"),
-    ("2024-01-20", "2024-01-26"),
-    ("2025-01-20", "2025-01-26"),
-    # 2. Holi / Spring Sale Peak (exact 5-6 days)
-    ("2023-03-04", "2023-03-09"),
-    ("2024-03-04", "2024-03-09"),
-    ("2025-03-10", "2025-03-15"),
-    # 3. Independence Day / Freedom Sale Peak (exact 6-7 days)
-    ("2023-08-09", "2023-08-15"),
-    ("2024-08-09", "2024-08-15"),
-    ("2025-08-09", "2025-08-15"),
-    # 4. Flipkart BBD / Amazon GIF Peak Phase 1 (exact 7-8 days)
-    ("2023-10-07", "2023-10-15"),
-    ("2024-09-23", "2024-10-01"),
-    ("2025-09-13", "2025-09-21"),
-    # 5. Diwali Festival Peak (exact 5-6 days)
-    ("2023-11-09", "2023-11-14"),
-    ("2024-10-26", "2024-10-31"),
-    ("2025-10-18", "2025-10-23"),
-    # 6. Black Friday / Cyber / Month-End Peak (exact 5 days)
-    ("2023-11-24", "2023-11-28"),
-    ("2024-11-29", "2024-12-03"),
-    ("2025-11-27", "2025-12-01"),
+EVENT_TIERS = [
+    # Tier 1 Megasale Peaks (3.5 Multiplier): Flipkart BBD Phase 1, Amazon GIF Launch Days, and Diwali Peak Days
+    (("2023-10-07", "2023-10-15"), 3.5),
+    (("2024-09-23", "2024-10-01"), 3.5),
+    (("2025-09-13", "2025-09-21"), 3.5),
+    (("2023-11-09", "2023-11-14"), 3.5),
+    (("2024-10-26", "2024-10-31"), 3.5),
+    (("2025-10-18", "2025-10-23"), 3.5),
+
+    # Tier 2 Major Festive Sales (2.0 Multiplier): Holi, Black Friday / Cyber Sales, Month-End Clearance
+    (("2023-03-04", "2023-03-09"), 2.0),
+    (("2024-03-04", "2024-03-09"), 2.0),
+    (("2025-03-10", "2025-03-15"), 2.0),
+    (("2023-11-24", "2023-11-28"), 2.0),
+    (("2024-11-29", "2024-12-03"), 2.0),
+    (("2025-11-27", "2025-12-01"), 2.0),
+
+    # Tier 3 Standard Events (1.0 Multiplier): Republic Day Sales, Independence Day Freedom Sales, regular promos
+    (("2023-01-20", "2023-01-26"), 1.0),
+    (("2024-01-20", "2024-01-26"), 1.0),
+    (("2025-01-20", "2025-01-26"), 1.0),
+    (("2023-08-09", "2023-08-15"), 1.0),
+    (("2024-08-09", "2024-08-15"), 1.0),
+    (("2025-08-09", "2025-08-15"), 1.0),
 ]
 
 
-def generate_dual_promo_covariates(date_range) -> tuple[np.ndarray, np.ndarray]:
+def generate_real_promo_covariate(date_range) -> tuple[np.ndarray, np.ndarray]:
     """
-    Maps exact Indian e-commerce sale event and festival dates into two precise binary features:
-      - peak_event_flag: Set to 1 ONLY during exact sale event dates and festival days (exact 5-8 peak days).
-      - pre_event_flag: Set to 1 ONLY for the 3 days immediately preceding the sale start date.
-      - All other days are 0.
+    Assigns weighted demand multipliers to peak_event_flag and pre_event_flag:
+      - Tier 1 Megasale Peaks (3.5 Multiplier): Flipkart BBD Phase 1, Amazon GIF Launch Days, Diwali Peak Days.
+      - Tier 2 Major Festive Sales (2.0 Multiplier): Holi, Black Friday / Cyber Sales, Month-End Clearance.
+      - Tier 3 Standard Events (1.0 Multiplier): Republic Day Sales, Independence Day Freedom Sales, regular promos.
+      - Pre-Event Buffer (pre_event_flag): Set to 0.5 for the 3 days immediately preceding any event start date.
+      - Normal Days: Set to 0.0.
     """
     dt_series = pd.to_datetime(pd.Series(date_range))
     peak_flag = np.zeros(len(dt_series), dtype=np.float32)
     pre_flag = np.zeros(len(dt_series), dtype=np.float32)
 
-    for start_str, end_str in PEAK_EVENT_RANGES:
+    for (start_str, end_str), mult in EVENT_TIERS:
         s_dt = pd.to_datetime(start_str)
         e_dt = pd.to_datetime(end_str)
 
-        # Peak event days
         peak_mask = (dt_series >= s_dt) & (dt_series <= e_dt)
-        peak_flag[peak_mask.values] = 1.0
+        peak_flag[peak_mask.values] = np.maximum(peak_flag[peak_mask.values], mult)
 
-        # Pre-event days: 3 days immediately preceding the sale start date
         pre_start = s_dt - pd.Timedelta(days=3)
         pre_end = s_dt - pd.Timedelta(days=1)
         pre_mask = (dt_series >= pre_start) & (dt_series <= pre_end)
-        pre_flag[pre_mask.values & (peak_flag == 0)] = 1.0
+        pre_flag[pre_mask.values & (peak_flag == 0)] = 0.5
 
     return peak_flag, pre_flag
 
 
+# Backward-compatible alias
+generate_dual_promo_covariates = generate_real_promo_covariate
+
+
 def generate_weekly_dual_covariates(weekly_dates) -> tuple[np.ndarray, np.ndarray]:
     """
-    Maps weekly dates (W-MON) to dual promotional flags:
-      - peak_event_flag: 1.0 if any day in the 7-day week is a peak event day, else 0.0.
-      - pre_event_flag: 1.0 if any day in the 7-day week is a pre-event day (and not already peak), else 0.0.
+    Maps weekly dates (W-MON) to weighted promotional multipliers:
+      - peak_event_flag: max peak multiplier in the 7-day week (0.0, 1.0, 2.0, or 3.5).
+      - pre_event_flag: 0.5 if pre-event buffer occurred in that week without a megasale peak.
     """
     w_peak = []
     w_pre = []
     for d in weekly_dates:
         d_ts = pd.to_datetime(d)
         week_days = pd.date_range(d_ts - pd.Timedelta(days=6), d_ts, freq="D")
-        d_peak, d_pre = generate_dual_promo_covariates(week_days)
-        is_peak = 1.0 if np.any(d_peak > 0) else 0.0
-        is_pre = 1.0 if (not is_peak and np.any(d_pre > 0)) else 0.0
-        w_peak.append(is_peak)
-        w_pre.append(is_pre)
+        d_peak, d_pre = generate_real_promo_covariate(week_days)
+        max_pk = float(np.max(d_peak))
+        max_pr = float(np.max(d_pre)) if max_pk == 0 else 0.0
+        w_peak.append(max_pk)
+        w_pre.append(max_pr)
     return np.array(w_peak, dtype=np.float32), np.array(w_pre, dtype=np.float32)
+
+
+def resample_timeline(df_to_resample: pd.DataFrame, resolution_mode: str, date_col: str = "date") -> pd.DataFrame:
+    """
+    Dynamically resamples and aggregates numeric metrics in df_to_resample
+    according to resolution_mode: "Daily", "Weekly (W-MON)", or "Monthly (MS)".
+    """
+    if resolution_mode == "Daily" or df_to_resample.empty:
+        return df_to_resample.copy()
+    rule = "W-MON" if resolution_mode == "Weekly (W-MON)" else "MS"
+    num_cols = [c for c in df_to_resample.columns if c != date_col and np.issubdtype(df_to_resample[c].dtype, np.number)]
+    return df_to_resample.set_index(date_col)[num_cols].resample(rule).sum().reset_index()
 
 
 # ==============================================================================
@@ -263,7 +278,7 @@ def train_and_forecast_xgboost(
     is_weekly: bool = False
 ) -> np.ndarray:
     """
-    Trains an XGBoost Regressor using month, weekend flag, dual promotional covariates
+    Trains an XGBoost Regressor using month, weekend flag, weighted promotional covariates
     (peak_event_flag and pre_event_flag), and lag/rolling average features.
     Supports both Daily (1d, 7d, 14d lags) and Weekly (1w, 2w, 4w lags) series.
     Recursive multi-step forecasting loop.
@@ -515,6 +530,15 @@ confidence_interval = st.sidebar.slider(
     help="Quantile interval band for uncertainty bounds and inventory safety stock."
 )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Resolution Calibration")
+view_resolution = st.sidebar.radio(
+    "Aggregate View Resolution",
+    ["Daily", "Weekly (W-MON)", "Monthly (MS)"],
+    index=0,
+    help="Dynamically resample and aggregate demand time-series and multi-model forecasts."
+)
+
 # ==============================================================================
 # Data Preparation, Hierarchical Aggregation, and ABC Smart Strategy
 # ==============================================================================
@@ -565,8 +589,8 @@ sku_daily["price"] = sku_daily["price"].fillna(active_price)
 sku_daily["month"] = sku_daily["date"].dt.month
 sku_daily["is_weekend"] = sku_daily["date"].dt.dayofweek.isin([5, 6]).astype(int)
 
-# Dual promotional covariates (Daily)
-d_peak, d_pre = generate_dual_promo_covariates(sku_daily["date"])
+# Weighted promotional magnitude covariates (Daily)
+d_peak, d_pre = generate_real_promo_covariate(sku_daily["date"])
 sku_daily["peak_event_flag"] = d_peak
 sku_daily["pre_event_flag"] = d_pre
 
@@ -601,7 +625,7 @@ elif sku_class == "Class A":
     badge_html = (
         '<span style="background-color: #166534; color: #ffffff; padding: 3px 9px; '
         'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
-        'Class A - High Volume / Revenue (Daily TimesFM-3 + Dual Promo Covariates)</span>'
+        'Class A - High Volume / Revenue (TimesFM-3 + Weighted Promos)</span>'
     )
 elif sku_class == "Class B":
     badge_html = (
@@ -618,10 +642,11 @@ else:
 
 st.markdown(f"**Active Selection:** `{selected_sku}` {badge_html}", unsafe_allow_html=True)
 
-if is_class_b:
+# Granularity baseline: Class B & C naturally resample to W-MON for sparse demand
+if (is_class_b or is_class_c) and selected_sku != "All":
     st.info(
-        "Class B Segment Strategy Active: Daily series aggregated into Weekly buckets (W-MON) "
-        "to eliminate high-frequency intermittency and noise. TimesFM 3.0 weekly neural inference and dual promotional covariates enabled."
+        f"{sku_class} Strategy Active: Series modeled at Weekly resolution (W-MON) with "
+        "intermittent/sparse demand safeguards active."
     )
     sku_series = (
         sku_daily.set_index("date")
@@ -634,27 +659,10 @@ if is_class_b:
     w_peak, w_pre = generate_weekly_dual_covariates(sku_series["date"])
     sku_series["peak_event_flag"] = w_peak
     sku_series["pre_event_flag"] = w_pre
-    time_grain_label = "Weekly"
-elif is_class_c:
-    st.info(
-        "Class C Segment Strategy Active: Aggregated into Weekly buckets (W-MON) with "
-        "Syntetos-Boylan Approximation (SBA) bias correction, zero-demand truncation (> 60 days), and Reorder Point / Safety Stock safeguards."
-    )
-    sku_series = (
-        sku_daily.set_index("date")
-        .resample("W-MON")
-        .agg({"sales": "sum", "revenue": "sum", "price": "first"})
-        .reset_index()
-    )
-    sku_series["month"] = sku_series["date"].dt.month
-    sku_series["is_weekend"] = 0
-    w_peak, w_pre = generate_weekly_dual_covariates(sku_series["date"])
-    sku_series["peak_event_flag"] = w_peak
-    sku_series["pre_event_flag"] = w_pre
-    time_grain_label = "Weekly"
+    base_modeling_grain = "Weekly"
 else:
     sku_series = sku_daily
-    time_grain_label = "Daily"
+    base_modeling_grain = "Daily"
 
 target_col = "revenue" if view_mode == "Expected Revenue" else "sales"
 curr_symbol = "₹" if view_mode == "Expected Revenue" else ""
@@ -669,29 +677,26 @@ high_idx = int(np.clip(np.argmin(np.abs(deciles - (1.0 - alpha_ci))), 0, 8))
 # Model Execution Engine
 # ==============================================================================
 if dashboard_mode == "Live Future Forecast":
-    # -------------------------------------------------------------------------
-    # Mode A: Live Future Forecast
-    # -------------------------------------------------------------------------
     historical_array = sku_series[target_col].values.astype(np.float32)
     historical_dates = sku_series["date"].values
     last_hist_date = pd.to_datetime(historical_dates[-1])
 
-    if time_grain_label == "Weekly":
+    if base_modeling_grain == "Weekly":
         horizon_steps = max(2, int(np.ceil(horizon_days / 7.0)))
         future_dates = [last_hist_date + datetime.timedelta(weeks=i) for i in range(1, horizon_steps + 1)]
         future_peaks, future_pres = generate_weekly_dual_covariates(future_dates)
     else:
         horizon_steps = horizon_days
         future_dates = [last_hist_date + datetime.timedelta(days=i) for i in range(1, horizon_steps + 1)]
-        future_peaks, future_pres = generate_dual_promo_covariates(future_dates)
+        future_peaks, future_pres = generate_real_promo_covariate(future_dates)
 
     past_future_covariates = np.stack([
         np.concatenate([sku_series["peak_event_flag"].values.astype(np.float32), future_peaks.astype(np.float32)]),
         np.concatenate([sku_series["pre_event_flag"].values.astype(np.float32), future_pres.astype(np.float32)])
     ])
 
-    with st.spinner(f"Computing multi-model projections for {horizon_steps} {time_grain_label.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Dual Promo Covariates (peak & pre)
+    with st.spinner(f"Computing multi-model projections for {horizon_steps} {base_modeling_grain.lower()} steps..."):
+        # 1. TimesFM 3.0 MLX Native Inference with Weighted Promo Covariates
         tfm_out = timesfm_model.predict(
             historical_array,
             horizon=horizon_steps,
@@ -704,9 +709,9 @@ if dashboard_mode == "Live Future Forecast":
         tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
         tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
-        # 2. XGBoost Multivariate Regressor with Dual Promo Covariates
+        # 2. XGBoost Multivariate Regressor with Weighted Promo Covariates
         xgb_pred = train_and_forecast_xgboost(
-            sku_series, target_col, future_dates, future_peaks, future_pres, is_weekly=(time_grain_label == "Weekly")
+            sku_series, target_col, future_dates, future_peaks, future_pres, is_weekly=(base_modeling_grain == "Weekly")
         )
 
         # 3. SBA Croston Intermittent with Zero-Demand Truncation
@@ -724,17 +729,37 @@ if dashboard_mode == "Live Future Forecast":
             xgb_pred = np.zeros(horizon_steps, dtype=np.float32)
             croston_pred = np.zeros(horizon_steps, dtype=np.float32)
 
-    tot_sales_baseline = float(np.sum(sku_series["sales"].values))
-    tot_revenue_proj = float(np.sum(timesfm_pred if view_mode == "Expected Revenue" else timesfm_pred * active_price))
-    tot_tfm = float(np.sum(timesfm_pred))
-    tot_xgb = float(np.sum(xgb_pred))
+    # Base un-resampled future and history frames
+    hist_frame = pd.DataFrame({"date": sku_series["date"], target_col: sku_series[target_col], "sales": sku_series["sales"]})
+    future_frame = pd.DataFrame({
+        "date": future_dates,
+        "timesfm": timesfm_pred,
+        "xgboost": xgb_pred,
+        "croston": croston_pred,
+        "tfm_lower": tfm_lower,
+        "tfm_upper": tfm_upper,
+        "sales": timesfm_pred if view_mode == "Sales Units" else timesfm_pred / active_price
+    })
+
+    # Option 2: Dynamic Portfolio Resolution Toggle
+    if view_resolution != base_modeling_grain:
+        plot_hist_df = resample_timeline(hist_frame, view_resolution)
+        plot_future_df = resample_timeline(future_frame, view_resolution)
+    else:
+        plot_hist_df = hist_frame
+        plot_future_df = future_frame
+
+    tot_sales_baseline = float(np.sum(hist_frame["sales"].values))
+    tot_revenue_proj = float(np.sum(future_frame["timesfm"] if view_mode == "Expected Revenue" else future_frame["timesfm"] * active_price))
+    tot_tfm = float(np.sum(future_frame["timesfm"]))
+    tot_xgb = float(np.sum(future_frame["xgboost"]))
 
     with st.container(border=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
         m2.metric("Projected Revenue Matrix", f"₹{tot_revenue_proj:,.0f}")
-        m3.metric(f"TimesFM Projected ({time_grain_label})", f"{curr_symbol}{tot_tfm:,.0f}{unit_suffix}")
-        m4.metric(f"XGBoost Projected ({time_grain_label})", f"{curr_symbol}{tot_xgb:,.0f}{unit_suffix}")
+        m3.metric(f"TimesFM Projected ({view_resolution})", f"{curr_symbol}{tot_tfm:,.0f}{unit_suffix}")
+        m4.metric(f"XGBoost Projected ({view_resolution})", f"{curr_symbol}{tot_xgb:,.0f}{unit_suffix}")
 
     if is_class_c:
         unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
@@ -784,8 +809,8 @@ else:
         np.concatenate([context_df["pre_event_flag"].values.astype(np.float32), truth_df["pre_event_flag"].values.astype(np.float32)])
     ])
 
-    with st.spinner(f"Executing validation benchmark across {dynamic_horizon} {time_grain_label.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Dual Promo Covariates (peak & pre)
+    with st.spinner(f"Executing validation benchmark across {dynamic_horizon} {base_modeling_grain.lower()} steps..."):
+        # 1. TimesFM 3.0 MLX Native Inference with Weighted Promo Covariates
         tfm_out = timesfm_model.predict(
             context_array,
             horizon=dynamic_horizon,
@@ -798,14 +823,14 @@ else:
         tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
         tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
-        # 2. XGBoost Multivariate Regressor with Dual Promo Covariates
+        # 2. XGBoost Multivariate Regressor with Weighted Promo Covariates
         xgb_pred = train_and_forecast_xgboost(
             context_df,
             target_col,
             list(truth_df["date"]),
             truth_df["peak_event_flag"].values.astype(np.float32),
             truth_df["pre_event_flag"].values.astype(np.float32),
-            is_weekly=(time_grain_label == "Weekly")
+            is_weekly=(base_modeling_grain == "Weekly")
         )
 
         # 3. SBA Croston Intermittent with Zero-Demand Truncation
@@ -823,29 +848,55 @@ else:
             xgb_pred = np.zeros(dynamic_horizon, dtype=np.float32)
             croston_pred = np.zeros(dynamic_horizon, dtype=np.float32)
 
-    sum_truth = float(max(np.sum(truth_array), 1.0))
+    # Assemble base truth frame for dynamic view resolution
+    base_context_frame = pd.DataFrame({"date": context_df["date"], target_col: context_df[target_col], "sales": context_df["sales"]})
+    base_truth_frame = pd.DataFrame({
+        "date": truth_df["date"],
+        "actual": truth_array,
+        "timesfm": timesfm_pred,
+        "xgboost": xgb_pred,
+        "croston": croston_pred,
+        "tfm_lower": tfm_lower,
+        "tfm_upper": tfm_upper,
+        "sales": truth_df["sales"]
+    })
 
-    def evaluate_model(preds: np.ndarray):
-        abs_err = np.abs(truth_array - preds)
+    # Option 2: Dynamic Portfolio Resolution Toggle
+    if view_resolution != base_modeling_grain:
+        plot_context_df = resample_timeline(base_context_frame, view_resolution)
+        plot_truth_df = resample_timeline(base_truth_frame, view_resolution)
+    else:
+        plot_context_df = base_context_frame
+        plot_truth_df = base_truth_frame
+
+    # Compute Validation Benchmark Metrics dynamically on resampled resolution
+    res_actual = plot_truth_df["actual"].values.astype(np.float32)
+    res_tfm = plot_truth_df["timesfm"].values.astype(np.float32)
+    res_xgb = plot_truth_df["xgboost"].values.astype(np.float32)
+    res_crs = plot_truth_df["croston"].values.astype(np.float32)
+    sum_truth = float(max(np.sum(res_actual), 1.0))
+
+    def evaluate_resampled_model(preds: np.ndarray):
+        abs_err = np.abs(res_actual - preds)
         mae_val = float(np.mean(abs_err))
         wape_val = float(np.sum(abs_err) / sum_truth)
         acc_val = float(max(0.0, (1.0 - wape_val) * 100.0))
         tot_pred = float(np.sum(preds))
         return acc_val, wape_val, mae_val, tot_pred
 
-    tfm_acc, tfm_wape, tfm_mae, tfm_tot = evaluate_model(timesfm_pred)
-    xgb_acc, xgb_wape, xgb_mae, xgb_tot = evaluate_model(xgb_pred)
-    crs_acc, crs_wape, crs_mae, crs_tot = evaluate_model(croston_pred)
+    tfm_acc, tfm_wape, tfm_mae, tfm_tot = evaluate_resampled_model(res_tfm)
+    xgb_acc, xgb_wape, xgb_mae, xgb_tot = evaluate_resampled_model(res_xgb)
+    crs_acc, crs_wape, crs_mae, crs_tot = evaluate_resampled_model(res_crs)
 
-    tot_sales_baseline = float(np.sum(context_df["sales"].values))
-    tot_revenue_proj = float(np.sum(timesfm_pred if view_mode == "Expected Revenue" else timesfm_pred * active_price))
+    tot_sales_baseline = float(np.sum(base_context_frame["sales"].values))
+    tot_revenue_proj = float(np.sum(res_tfm if view_mode == "Expected Revenue" else res_tfm * active_price))
 
     with st.container(border=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
         m2.metric("Projected Revenue Matrix", f"₹{tot_revenue_proj:,.0f}")
-        m3.metric("TimesFM Validation Accuracy", f"{tfm_acc:.1f}%")
-        m4.metric("TimesFM Error Margin (WAPE)", f"{tfm_wape * 100:.1f}%")
+        m3.metric(f"TimesFM Accuracy ({view_resolution})", f"{tfm_acc:.1f}%")
+        m4.metric(f"TimesFM WAPE ({view_resolution})", f"{tfm_wape * 100:.1f}%")
 
     if is_class_c:
         unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
@@ -869,7 +920,7 @@ else:
                 "Inactive / Discontinued (Zero Truncation)" if is_discontinued else "Active Intermittent Demand"
             )
 
-    st.subheader(f"Historical Validation & Model Performance Matrix ({cutoff_date_str} to 2025-12-31)")
+    st.subheader(f"Historical Validation & Model Performance Matrix ({cutoff_date_str} to 2025-12-31 - {view_resolution} Resolution)")
 
     benchmark_data = [
         {
@@ -881,7 +932,7 @@ else:
             "Actual Ground Truth Sum": f"{curr_symbol}{sum_truth:,.0f}{unit_suffix}"
         },
         {
-            "Model Architecture": "XGBoost Regressor (Multivariate + Dual Promo)",
+            "Model Architecture": "XGBoost Regressor (Multivariate + Weighted Promo)",
             "Prediction Accuracy": f"{xgb_acc:.1f}%",
             "WAPE (Error Margin)": f"{xgb_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{xgb_mae:,.1f}{unit_suffix}",
@@ -911,7 +962,7 @@ else:
         sfx = "" if metric_mode == "Expected Revenue" else " units"
 
         configs = [
-            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Dual Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
+            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Weighted Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
             ("Class B Segment", "Class B", "Google TimesFM 3.0 (MLX)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
             ("Class C Segment", "Class C", "SBA Intermittent Method (Syntetos-Boylan)", "Weekly (W-MON)", "Reorder Point (ROP) & Safety Stock Safeguards")
         ]
@@ -928,7 +979,7 @@ else:
                 sub["peak_event_flag"] = w_pk
                 sub["pre_event_flag"] = w_pr
             else:
-                d_pk, d_pr = generate_dual_promo_covariates(sub["date"])
+                d_pk, d_pr = generate_real_promo_covariate(sub["date"])
                 sub["peak_event_flag"] = d_pk
                 sub["pre_event_flag"] = d_pr
 
@@ -976,75 +1027,76 @@ else:
 st.markdown("---")
 
 # ==============================================================================
-# Complete Plotly Interactivity (go.Figure)
+# Complete Plotly Interactivity (go.Figure) - Dynamic Resolution
 # ==============================================================================
-st.subheader(f"Interactive Multi-Model Timeline Graph ({time_grain_label} Resolution)")
+st.subheader(f"Interactive Multi-Model Timeline Graph ({view_resolution} Resolution)")
 
 fig = go.Figure()
 num_fmt = ":,.1f" if view_mode == "Expected Revenue" else ":,.1f"
 
 if dashboard_mode == "Historical Validation (Backtesting)":
     fig.add_trace(go.Scatter(
-        x=context_dates,
-        y=context_array,
+        x=plot_context_df["date"],
+        y=plot_context_df[target_col],
         mode="lines",
-        name="Historical Context Baseline",
+        name=f"Historical Context ({view_resolution})",
         line=dict(color="#1f77b4", width=2),
         hovertemplate=f"<b>Historical Context</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=truth_array,
+        x=plot_truth_df["date"],
+        y=plot_truth_df["actual"],
         mode="lines",
-        name="Actual Real Sales Ground Truth",
+        name=f"Actual Real Sales ({view_resolution})",
         line=dict(color="#2ca02c", width=2.5),
         hovertemplate=f"<b>Actual Real Sales</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=timesfm_pred,
+        x=plot_truth_df["date"],
+        y=plot_truth_df["timesfm"],
         mode="lines",
-        name="TimesFM Forecast",
+        name=f"TimesFM Forecast ({view_resolution})",
         line=dict(color="#ff7f0e", width=2.5, dash="dash"),
         hovertemplate=f"<b>TimesFM Forecast</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=tfm_lower,
-        mode="lines",
-        line=dict(width=0),
-        showlegend=False,
-        hoverinfo="skip"
-    ))
-    fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=tfm_upper,
-        mode="lines",
-        line=dict(width=0),
-        fill="tonexty",
-        fillcolor="rgba(255, 127, 14, 0.22)",
-        name=f"TimesFM {confidence_interval}% CI",
-        showlegend=True,
-        hoverinfo="skip"
-    ))
+    if "tfm_lower" in plot_truth_df.columns and "tfm_upper" in plot_truth_df.columns:
+        fig.add_trace(go.Scatter(
+            x=plot_truth_df["date"],
+            y=plot_truth_df["tfm_lower"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+        fig.add_trace(go.Scatter(
+            x=plot_truth_df["date"],
+            y=plot_truth_df["tfm_upper"],
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(255, 127, 14, 0.22)",
+            name=f"TimesFM {confidence_interval}% CI",
+            showlegend=True,
+            hoverinfo="skip"
+        ))
 
     fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=xgb_pred,
+        x=plot_truth_df["date"],
+        y=plot_truth_df["xgboost"],
         mode="lines",
-        name="XGBoost Multivariate",
+        name=f"XGBoost ({view_resolution})",
         line=dict(color="#9467bd", width=2.2, dash="dash"),
-        hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
+        hovertemplate=f"<b>XGBoost</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     fig.add_trace(go.Scatter(
-        x=truth_dates,
-        y=croston_pred,
+        x=plot_truth_df["date"],
+        y=plot_truth_df["croston"],
         mode="lines",
-        name="SBA Croston Intermittent",
+        name=f"SBA Croston ({view_resolution})",
         line=dict(color="#d62728", width=2.0, dash="dashdot"),
         hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
@@ -1060,69 +1112,63 @@ if dashboard_mode == "Historical Validation (Backtesting)":
 
     chart_title = (
         f"Validation Benchmark: {selected_sku} | {sku_desc[:35]} "
-        f"({view_mode}) | Split Date: {cutoff_date_str} [{time_grain_label}]"
+        f"({view_mode}) | Cutoff: {cutoff_date_str} [{view_resolution} Resolution]"
     )
 
 else:
     fig.add_trace(go.Scatter(
-        x=historical_dates,
-        y=historical_array,
+        x=plot_hist_df["date"],
+        y=plot_hist_df[target_col],
         mode="lines",
-        name="Historical Context Baseline",
+        name=f"Historical Baseline ({view_resolution})",
         line=dict(color="#1f77b4", width=2),
         hovertemplate=f"<b>Historical Context</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    conn_dates = [last_hist_date] + future_dates
-    conn_tfm = np.concatenate([[historical_array[-1]], timesfm_pred])
-    conn_xgb = np.concatenate([[historical_array[-1]], xgb_pred])
-    conn_crs = np.concatenate([[historical_array[-1]], croston_pred])
-    conn_low = np.concatenate([[historical_array[-1]], tfm_lower])
-    conn_high = np.concatenate([[historical_array[-1]], tfm_upper])
-
     fig.add_trace(go.Scatter(
-        x=conn_dates,
-        y=conn_tfm,
+        x=plot_future_df["date"],
+        y=plot_future_df["timesfm"],
         mode="lines",
-        name="TimesFM Forecast",
+        name=f"TimesFM Forecast ({view_resolution})",
         line=dict(color="#ff7f0e", width=2.5, dash="dash"),
         hovertemplate=f"<b>TimesFM Forecast</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    fig.add_trace(go.Scatter(
-        x=conn_dates,
-        y=conn_low,
-        mode="lines",
-        line=dict(width=0),
-        showlegend=False,
-        hoverinfo="skip"
-    ))
-    fig.add_trace(go.Scatter(
-        x=conn_dates,
-        y=conn_high,
-        mode="lines",
-        line=dict(width=0),
-        fill="tonexty",
-        fillcolor="rgba(255, 127, 14, 0.22)",
-        name=f"TimesFM {confidence_interval}% CI",
-        showlegend=True,
-        hoverinfo="skip"
-    ))
+    if "tfm_lower" in plot_future_df.columns and "tfm_upper" in plot_future_df.columns:
+        fig.add_trace(go.Scatter(
+            x=plot_future_df["date"],
+            y=plot_future_df["tfm_lower"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+        fig.add_trace(go.Scatter(
+            x=plot_future_df["date"],
+            y=plot_future_df["tfm_upper"],
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(255, 127, 14, 0.22)",
+            name=f"TimesFM {confidence_interval}% CI",
+            showlegend=True,
+            hoverinfo="skip"
+        ))
 
     fig.add_trace(go.Scatter(
-        x=conn_dates,
-        y=conn_xgb,
+        x=plot_future_df["date"],
+        y=plot_future_df["xgboost"],
         mode="lines",
-        name="XGBoost Multivariate",
+        name=f"XGBoost ({view_resolution})",
         line=dict(color="#9467bd", width=2.2, dash="dash"),
-        hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
+        hovertemplate=f"<b>XGBoost</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
     fig.add_trace(go.Scatter(
-        x=conn_dates,
-        y=conn_crs,
+        x=plot_future_df["date"],
+        y=plot_future_df["croston"],
         mode="lines",
-        name="SBA Croston Intermittent",
+        name=f"SBA Croston ({view_resolution})",
         line=dict(color="#d62728", width=2.0, dash="dashdot"),
         hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
@@ -1137,14 +1183,14 @@ else:
     )
 
     chart_title = (
-        f"Live Demand Projection ({horizon_steps} {time_grain_label} Steps): "
+        f"Live Demand Projection ({len(plot_future_df)} {view_resolution} Steps): "
         f"{selected_sku} | {sku_desc[:35]} ({view_mode})"
     )
 
 fig.update_layout(
     title=dict(text=chart_title, font=dict(size=14, color="#0f172a")),
     xaxis=dict(
-        title="Timeline",
+        title=f"Timeline ({view_resolution})",
         type="date",
         rangeslider=dict(visible=True, thickness=0.08),
         gridcolor="#f1f5f9"
@@ -1175,41 +1221,35 @@ st.subheader("Export Forecast Matrix")
 
 if dashboard_mode == "Historical Validation (Backtesting)":
     export_df = pd.DataFrame({
-        "date": [d.strftime("%Y-%m-%d") for d in truth_df["date"]],
+        "date": [d.strftime("%Y-%m-%d") for d in plot_truth_df["date"]],
         "sku": selected_sku,
         "sku_classification": sku_class,
+        "resolution": view_resolution,
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
-        "peak_event_flag": truth_df["peak_event_flag"].values,
-        "pre_event_flag": truth_df["pre_event_flag"].values,
-        f"actual_{target_col}": np.round(truth_array, 1),
-        f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
-        f"xgboost_{target_col}": np.round(xgb_pred, 1),
-        f"sba_croston_{target_col}": np.round(croston_pred, 1),
-        "timesfm3_lower_bound": np.round(tfm_lower, 1),
-        "timesfm3_upper_bound": np.round(tfm_upper, 1),
+        f"actual_{target_col}": np.round(res_actual, 1),
+        f"timesfm3_{target_col}": np.round(res_tfm, 1),
+        f"xgboost_{target_col}": np.round(res_xgb, 1),
+        f"sba_croston_{target_col}": np.round(res_crs, 1),
         "confidence_level": f"{confidence_interval}%"
     })
-    filename = f"validation_matrix_{selected_sku}_{cutoff_date_str}_{target_col}.csv"
+    filename = f"validation_matrix_{selected_sku}_{cutoff_date_str}_{view_resolution}_{target_col}.csv"
 else:
     export_df = pd.DataFrame({
-        "date": [d.strftime("%Y-%m-%d") for d in future_dates],
+        "date": [d.strftime("%Y-%m-%d") for d in plot_future_df["date"]],
         "sku": selected_sku,
         "sku_classification": sku_class,
+        "resolution": view_resolution,
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
-        "peak_event_flag": future_peaks,
-        "pre_event_flag": future_pres,
-        f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
-        f"xgboost_{target_col}": np.round(xgb_pred, 1),
-        f"sba_croston_{target_col}": np.round(croston_pred, 1),
-        "timesfm3_lower_bound": np.round(tfm_lower, 1),
-        "timesfm3_upper_bound": np.round(tfm_upper, 1),
+        f"timesfm3_{target_col}": np.round(plot_future_df["timesfm"], 1),
+        f"xgboost_{target_col}": np.round(plot_future_df["xgboost"], 1),
+        f"sba_croston_{target_col}": np.round(plot_future_df["croston"], 1),
         "confidence_level": f"{confidence_interval}%"
     })
-    filename = f"forecast_matrix_{selected_sku}_{horizon_steps}_{target_col}.csv"
+    filename = f"forecast_matrix_{selected_sku}_{horizon_steps}_{view_resolution}_{target_col}.csv"
 
 csv_buffer = io.StringIO()
 export_df.to_csv(csv_buffer, index=False)
