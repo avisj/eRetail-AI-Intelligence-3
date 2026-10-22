@@ -431,6 +431,94 @@ def compute_safety_stock_rop(
     rop = int(np.ceil((daily_rate * lead_time_days) + safety_stock))
     return safety_stock, rop
 
+
+def compute_evaluation_metrics(actual, pred):
+    """
+    Computes enterprise validation and benchmark evaluation metrics:
+    - Validation Accuracy (%) = max(0.0, (1 - WAPE) * 100)
+    - WAPE = sum(|actual - pred|) / max(sum(actual), 1.0)
+    - MAE = mean(|actual - pred|)
+    - Total Projected = sum(pred)
+    """
+    actual_f = np.asarray(actual, dtype=np.float32)
+    pred_f = np.asarray(pred, dtype=np.float32)
+    abs_err = np.abs(actual_f - pred_f)
+    mae_val = float(np.mean(abs_err))
+    s_truth = float(max(np.sum(actual_f), 1.0))
+    wape_val = float(np.sum(abs_err) / s_truth)
+    acc_val = float(max(0.0, (1.0 - wape_val) * 100.0))
+    tot_pred = float(np.sum(pred_f))
+    return acc_val, wape_val, mae_val, tot_pred
+
+
+@st.cache_data(show_spinner=False)
+def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame:
+    """
+    Recalculates class-level macroeconomic backtesting benchmarks across the portfolio
+    dynamically for the selected validation cutoff date and target metric.
+    """
+    c_dt = pd.to_datetime(cutoff_date)
+    v_dt = pd.to_datetime("2025-12-31")
+    col = "revenue" if metric_mode == "Expected Revenue" else "sales"
+    sym = "₹" if metric_mode == "Expected Revenue" else ""
+    sfx = "" if metric_mode == "Expected Revenue" else " units"
+
+    configs = [
+        ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Weighted Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
+        ("Class B Segment", "Class B", "Google TimesFM 3.0 (MLX)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
+        ("Class C Segment", "Class C", "SBA Intermittent Method (Syntetos-Boylan)", "Weekly (W-MON)", "Reorder Point (ROP) & Safety Stock Safeguards")
+    ]
+    out_rows = []
+    for label, cls, engine, res, strat in configs:
+        sub = compiled_df[compiled_df["sku_class"] == cls].groupby("date")[[col]].sum().reset_index().sort_values("date")
+        f_timeline = pd.date_range(sub["date"].min(), sub["date"].max(), freq="D")
+        sub = sub.set_index("date").reindex(f_timeline).rename_axis("date").reset_index()
+        sub[col] = sub[col].fillna(0.0)
+
+        if "Weekly" in res:
+            sub = sub.set_index("date").resample("W-MON").sum().reset_index()
+            w_pk, w_pr = generate_weekly_dual_covariates(sub["date"])
+            sub["peak_event_flag"] = w_pk
+            sub["pre_event_flag"] = w_pr
+        else:
+            d_pk, d_pr = generate_real_promo_covariate(sub["date"])
+            sub["peak_event_flag"] = d_pk
+            sub["pre_event_flag"] = d_pr
+
+        c_df = sub[sub["date"] <= c_dt]
+        t_df = sub[(sub["date"] > c_dt) & (sub["date"] <= v_dt)]
+        if c_df.empty or t_df.empty:
+            continue
+
+        c_vals = c_df[col].values.astype(np.float32)
+        t_vals = t_df[col].values.astype(np.float32)
+        p_cov = np.stack([
+            sub["peak_event_flag"].values.astype(np.float32),
+            sub["pre_event_flag"].values.astype(np.float32)
+        ])
+        h_len = len(t_vals)
+
+        if cls in ["Class A", "Class B"]:
+            m_out = timesfm_model.predict(
+                c_vals, horizon=h_len, past_future_covariates=p_cov, padding_mode="edge"
+            )
+            p_vals = np.asarray(m_out.forecast, dtype=np.float32)
+        else:
+            p_vals, _, _ = sba_croston_forecast(c_vals, horizon=h_len, alpha=0.1)
+
+        acc_m, wape_m, mae_m, _ = compute_evaluation_metrics(t_vals, p_vals)
+
+        out_rows.append({
+            "SKU Segment Class": label,
+            "Forecasting Engine": engine,
+            "Resolution": res,
+            "Validation Accuracy": f"{acc_m:.1f}%",
+            "WAPE (Error Margin)": f"{wape_m * 100:.1f}%",
+            "MAE": f"{sym}{mae_m:,.1f}{sfx}",
+            "Recommended Inventory Strategy": strat
+        })
+    return pd.DataFrame(out_rows)
+
 # ==============================================================================
 # UI Control Panel: Sidebar (Hierarchical Drill-Down with Class Filter & ALL Defaults)
 # ==============================================================================
@@ -754,6 +842,15 @@ if dashboard_mode == "Live Future Forecast":
     tot_tfm = float(np.sum(future_frame["timesfm"]))
     tot_xgb = float(np.sum(future_frame["xgboost"]))
 
+    active_class_label = (
+        "All SKU Classes (Portfolio Aggregate)" if selected_sku == "All" and selected_class == "ALL"
+        else (f"{selected_class} Segment" if selected_sku == "All" else f"{sku_class} (SKU {selected_sku})")
+    )
+    horizon_label = f"{horizon_days} Calendar Days"
+    st.caption(
+        f"Showing performance for **{active_class_label}** aggregated at **{view_resolution}** over a **{horizon_label}** horizon."
+    )
+
     with st.container(border=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
@@ -876,27 +973,29 @@ else:
     res_crs = plot_truth_df["croston"].values.astype(np.float32)
     sum_truth = float(max(np.sum(res_actual), 1.0))
 
-    def evaluate_resampled_model(preds: np.ndarray):
-        abs_err = np.abs(res_actual - preds)
-        mae_val = float(np.mean(abs_err))
-        wape_val = float(np.sum(abs_err) / sum_truth)
-        acc_val = float(max(0.0, (1.0 - wape_val) * 100.0))
-        tot_pred = float(np.sum(preds))
-        return acc_val, wape_val, mae_val, tot_pred
-
-    tfm_acc, tfm_wape, tfm_mae, tfm_tot = evaluate_resampled_model(res_tfm)
-    xgb_acc, xgb_wape, xgb_mae, xgb_tot = evaluate_resampled_model(res_xgb)
-    crs_acc, crs_wape, crs_mae, crs_tot = evaluate_resampled_model(res_crs)
+    tfm_acc, tfm_wape, tfm_mae, tfm_tot = compute_evaluation_metrics(res_actual, res_tfm)
+    xgb_acc, xgb_wape, xgb_mae, xgb_tot = compute_evaluation_metrics(res_actual, res_xgb)
+    crs_acc, crs_wape, crs_mae, crs_tot = compute_evaluation_metrics(res_actual, res_crs)
 
     tot_sales_baseline = float(np.sum(base_context_frame["sales"].values))
     tot_revenue_proj = float(np.sum(res_tfm if view_mode == "Expected Revenue" else res_tfm * active_price))
 
+    active_class_label = (
+        "All SKU Classes (Portfolio Aggregate)" if selected_sku == "All" and selected_class == "ALL"
+        else (f"{selected_class} Segment" if selected_sku == "All" else f"{sku_class} (SKU {selected_sku})")
+    )
+    horizon_label = f"{dynamic_horizon} Calendar Days ({cutoff_date_str} to 2025-12-31)"
+    st.caption(
+        f"Showing performance for **{active_class_label}** aggregated at **{view_resolution}** over a **{horizon_label}** horizon."
+    )
+
     with st.container(border=True):
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
         m2.metric("Projected Revenue Matrix", f"₹{tot_revenue_proj:,.0f}")
-        m3.metric(f"TimesFM Accuracy ({view_resolution})", f"{tfm_acc:.1f}%")
-        m4.metric(f"TimesFM WAPE ({view_resolution})", f"{tfm_wape * 100:.1f}%")
+        m3.metric(f"Validation Accuracy ({view_resolution})", f"{tfm_acc:.1f}%")
+        m4.metric(f"WAPE (Error Margin) ({view_resolution})", f"{tfm_wape * 100:.1f}%")
+        m5.metric(f"MAE ({view_resolution})", f"{curr_symbol}{tfm_mae:,.1f}{unit_suffix}")
 
     if is_class_c:
         unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
@@ -925,7 +1024,7 @@ else:
     benchmark_data = [
         {
             "Model Architecture": "Google TimesFM 3.0 (MLX Foundation Model)",
-            "Prediction Accuracy": f"{tfm_acc:.1f}%",
+            "Validation Accuracy": f"{tfm_acc:.1f}%",
             "WAPE (Error Margin)": f"{tfm_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{tfm_mae:,.1f}{unit_suffix}",
             "Projected Sum": f"{curr_symbol}{tfm_tot:,.0f}{unit_suffix}",
@@ -933,7 +1032,7 @@ else:
         },
         {
             "Model Architecture": "XGBoost Regressor (Multivariate + Weighted Promo)",
-            "Prediction Accuracy": f"{xgb_acc:.1f}%",
+            "Validation Accuracy": f"{xgb_acc:.1f}%",
             "WAPE (Error Margin)": f"{xgb_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{xgb_mae:,.1f}{unit_suffix}",
             "Projected Sum": f"{curr_symbol}{xgb_tot:,.0f}{unit_suffix}",
@@ -941,7 +1040,7 @@ else:
         },
         {
             "Model Architecture": "SBA Croston (Intermittent Baseline)",
-            "Prediction Accuracy": f"{crs_acc:.1f}%",
+            "Validation Accuracy": f"{crs_acc:.1f}%",
             "WAPE (Error Margin)": f"{crs_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{crs_mae:,.1f}{unit_suffix}",
             "Projected Sum": f"{curr_symbol}{crs_tot:,.0f}{unit_suffix}",
@@ -951,75 +1050,7 @@ else:
     st.table(pd.DataFrame(benchmark_data))
 
     st.subheader("Accuracy Benchmark Breakdown by SKU Segment Class")
-    st.caption("Class-level macroeconomic backtesting benchmarks across the portfolio (Validation Period to 2025-12-31):")
-
-    @st.cache_data(show_spinner=False)
-    def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame:
-        c_dt = pd.to_datetime(cutoff_date)
-        v_dt = pd.to_datetime("2025-12-31")
-        col = "revenue" if metric_mode == "Expected Revenue" else "sales"
-        sym = "₹" if metric_mode == "Expected Revenue" else ""
-        sfx = "" if metric_mode == "Expected Revenue" else " units"
-
-        configs = [
-            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Weighted Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
-            ("Class B Segment", "Class B", "Google TimesFM 3.0 (MLX)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
-            ("Class C Segment", "Class C", "SBA Intermittent Method (Syntetos-Boylan)", "Weekly (W-MON)", "Reorder Point (ROP) & Safety Stock Safeguards")
-        ]
-        out_rows = []
-        for label, cls, engine, res, strat in configs:
-            sub = compiled_df[compiled_df["sku_class"] == cls].groupby("date")[[col]].sum().reset_index().sort_values("date")
-            f_timeline = pd.date_range(sub["date"].min(), sub["date"].max(), freq="D")
-            sub = sub.set_index("date").reindex(f_timeline).rename_axis("date").reset_index()
-            sub[col] = sub[col].fillna(0.0)
-
-            if "Weekly" in res:
-                sub = sub.set_index("date").resample("W-MON").sum().reset_index()
-                w_pk, w_pr = generate_weekly_dual_covariates(sub["date"])
-                sub["peak_event_flag"] = w_pk
-                sub["pre_event_flag"] = w_pr
-            else:
-                d_pk, d_pr = generate_real_promo_covariate(sub["date"])
-                sub["peak_event_flag"] = d_pk
-                sub["pre_event_flag"] = d_pr
-
-            c_df = sub[sub["date"] <= c_dt]
-            t_df = sub[(sub["date"] > c_dt) & (sub["date"] <= v_dt)]
-            if c_df.empty or t_df.empty:
-                continue
-
-            c_vals = c_df[col].values.astype(np.float32)
-            t_vals = t_df[col].values.astype(np.float32)
-            p_cov = np.stack([
-                sub["peak_event_flag"].values.astype(np.float32),
-                sub["pre_event_flag"].values.astype(np.float32)
-            ])
-            h_len = len(t_vals)
-            s_truth = float(max(np.sum(t_vals), 1.0))
-
-            if cls in ["Class A", "Class B"]:
-                m_out = timesfm_model.predict(
-                    c_vals, horizon=h_len, past_future_covariates=p_cov, padding_mode="edge"
-                )
-                p_vals = np.asarray(m_out.forecast, dtype=np.float32)
-            else:
-                p_vals, _, _ = sba_croston_forecast(c_vals, horizon=h_len, alpha=0.1)
-
-            err = np.abs(t_vals - p_vals)
-            mae_m = float(np.mean(err))
-            wape_m = float(np.sum(err) / s_truth)
-            acc_m = float(max(0.0, (1.0 - wape_m) * 100.0))
-
-            out_rows.append({
-                "SKU Segment Class": label,
-                "Forecasting Engine": engine,
-                "Resolution": res,
-                "Validation Accuracy": f"{acc_m:.1f}%",
-                "WAPE (Error Margin)": f"{wape_m * 100:.1f}%",
-                "MAE": f"{sym}{mae_m:,.1f}{sfx}",
-                "Recommended Inventory Strategy": strat
-            })
-        return pd.DataFrame(out_rows)
+    st.caption(f"Class-level macroeconomic backtesting benchmarks across the portfolio ({cutoff_date_str} to 2025-12-31):")
 
     class_benchmark_df = compute_class_benchmarks(cutoff_date_str, view_mode)
     st.table(class_benchmark_df)
