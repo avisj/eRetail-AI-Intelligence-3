@@ -25,80 +25,81 @@ st.caption(
 )
 
 # ==============================================================================
-# 1. Real Calendar Promotional Covariate Engine (2023 - 2025)
+# 1. Dual Promotional Covariate Engine: Peak Event & Pre-Event Flags (2023 - 2025)
 # ==============================================================================
-PROMO_RANGES = [
-    # Republic Day Sales
-    ("2023-01-14", "2023-01-26"),
-    ("2024-01-13", "2024-01-26"),
-    ("2025-01-13", "2025-01-26"),
-    # Holi
-    ("2023-02-24", "2023-03-11"),
-    ("2024-03-13", "2024-03-28"),
-    ("2025-03-02", "2025-03-17"),
-    # Independence Day / Freedom Sales
-    ("2023-08-03", "2023-08-18"),
-    ("2024-07-25", "2024-08-18"),
-    ("2025-07-20", "2025-08-18"),
-    # Flipkart BBD / Amazon GIF / Festive Season
-    ("2023-09-26", "2023-11-15"),
-    ("2024-09-15", "2024-11-03"),
-    ("2025-09-11", "2025-10-23"),
+PEAK_EVENT_RANGES = [
+    # 1. Republic Day Sale Peak (exact 5-7 days)
+    ("2023-01-20", "2023-01-26"),
+    ("2024-01-20", "2024-01-26"),
+    ("2025-01-20", "2025-01-26"),
+    # 2. Holi / Spring Sale Peak (exact 5-6 days)
+    ("2023-03-04", "2023-03-09"),
+    ("2024-03-04", "2024-03-09"),
+    ("2025-03-10", "2025-03-15"),
+    # 3. Independence Day / Freedom Sale Peak (exact 6-7 days)
+    ("2023-08-09", "2023-08-15"),
+    ("2024-08-09", "2024-08-15"),
+    ("2025-08-09", "2025-08-15"),
+    # 4. Flipkart BBD / Amazon GIF Peak Phase 1 (exact 7-8 days)
+    ("2023-10-07", "2023-10-15"),
+    ("2024-09-23", "2024-10-01"),
+    ("2025-09-13", "2025-09-21"),
+    # 5. Diwali Festival Peak (exact 5-6 days)
+    ("2023-11-09", "2023-11-14"),
+    ("2024-10-26", "2024-10-31"),
+    ("2025-10-18", "2025-10-23"),
+    # 6. Black Friday / Cyber / Month-End Peak (exact 5 days)
+    ("2023-11-24", "2023-11-28"),
+    ("2024-11-29", "2024-12-03"),
+    ("2025-11-27", "2025-12-01"),
 ]
 
 
-def merge_date_intervals(intervals: list[tuple[str, str]]) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-    """Merges overlapping or contiguous date ranges into an unbroken continuous window."""
-    parsed = [(pd.to_datetime(s), pd.to_datetime(e)) for s, e in intervals]
-    parsed.sort(key=lambda x: x[0])
-    merged = []
-    for s, e in parsed:
-        if not merged:
-            merged.append((s, e))
-        else:
-            prev_s, prev_e = merged[-1]
-            if s <= prev_e + pd.Timedelta(days=1):
-                merged[-1] = (prev_s, max(prev_e, e))
-            else:
-                merged.append((s, e))
-    return merged
-
-
-MERGED_PROMO_RANGES = merge_date_intervals(PROMO_RANGES)
-
-
-def generate_real_promo_covariate(date_range) -> np.ndarray:
+def generate_dual_promo_covariates(date_range) -> tuple[np.ndarray, np.ndarray]:
     """
-    Maps exact Indian e-commerce sales and festival dates into a binary feature (promo_flag: 1 or 0).
-    Builds the event window pinned strictly to verified dates:
-      - Republic Day Sales: Jan 14-26 (2023), Jan 13-26 (2024), Jan 13-26 (2025)
-      - Holi: Feb 24-Mar 11 (2023), Mar 13-28 (2024), Mar 2-17 (2025)
-      - Independence Day / Freedom Sales: Aug 3-18 (2023), Jul 25-Aug 18 (2024), Jul 20-Aug 18 (2025)
-      - Flipkart BBD / Amazon GIF / Festive Season:
-        * 2023: Sep 26 to Nov 15
-        * 2024: Sep 15 to Nov 03
-        * 2025: Sep 11 to Oct 23
-    Overlapping ranges merge into an unbroken continuous window.
+    Maps exact Indian e-commerce sale event and festival dates into two precise binary features:
+      - peak_event_flag: Set to 1 ONLY during exact sale event dates and festival days (exact 5-8 peak days).
+      - pre_event_flag: Set to 1 ONLY for the 3 days immediately preceding the sale start date.
+      - All other days are 0.
     """
     dt_series = pd.to_datetime(pd.Series(date_range))
-    promo = np.zeros(len(dt_series), dtype=np.float32)
-    for s_dt, e_dt in MERGED_PROMO_RANGES:
-        mask = (dt_series >= s_dt) & (dt_series <= e_dt)
-        promo[mask.values] = 1.0
-    return promo
+    peak_flag = np.zeros(len(dt_series), dtype=np.float32)
+    pre_flag = np.zeros(len(dt_series), dtype=np.float32)
+
+    for start_str, end_str in PEAK_EVENT_RANGES:
+        s_dt = pd.to_datetime(start_str)
+        e_dt = pd.to_datetime(end_str)
+
+        # Peak event days
+        peak_mask = (dt_series >= s_dt) & (dt_series <= e_dt)
+        peak_flag[peak_mask.values] = 1.0
+
+        # Pre-event days: 3 days immediately preceding the sale start date
+        pre_start = s_dt - pd.Timedelta(days=3)
+        pre_end = s_dt - pd.Timedelta(days=1)
+        pre_mask = (dt_series >= pre_start) & (dt_series <= pre_end)
+        pre_flag[pre_mask.values & (peak_flag == 0)] = 1.0
+
+    return peak_flag, pre_flag
 
 
-def generate_weekly_promo_covariate(weekly_dates) -> np.ndarray:
+def generate_weekly_dual_covariates(weekly_dates) -> tuple[np.ndarray, np.ndarray]:
     """
-    Maps weekly dates (W-MON) to promotional flag (1.0 if any day in the 7-day week is promotional, else 0.0).
+    Maps weekly dates (W-MON) to dual promotional flags:
+      - peak_event_flag: 1.0 if any day in the 7-day week is a peak event day, else 0.0.
+      - pre_event_flag: 1.0 if any day in the 7-day week is a pre-event day (and not already peak), else 0.0.
     """
-    w_promos = []
+    w_peak = []
+    w_pre = []
     for d in weekly_dates:
         d_ts = pd.to_datetime(d)
         week_days = pd.date_range(d_ts - pd.Timedelta(days=6), d_ts, freq="D")
-        day_promos = generate_real_promo_covariate(week_days)
-        w_promos.append(1.0 if np.any(day_promos > 0) else 0.0)
-    return np.array(w_promos, dtype=np.float32)
+        d_peak, d_pre = generate_dual_promo_covariates(week_days)
+        is_peak = 1.0 if np.any(d_peak > 0) else 0.0
+        is_pre = 1.0 if (not is_peak and np.any(d_pre > 0)) else 0.0
+        w_peak.append(is_peak)
+        w_pre.append(is_pre)
+    return np.array(w_peak, dtype=np.float32), np.array(w_pre, dtype=np.float32)
 
 
 # ==============================================================================
@@ -116,7 +117,6 @@ def load_and_compile_data() -> pd.DataFrame:
         df_cached = pd.read_parquet(cache_file)
         df_cached["date"] = pd.to_datetime(df_cached["date"])
 
-        # Ensure multivariate and financial features are present
         if "month" not in df_cached.columns:
             df_cached["month"] = df_cached["date"].dt.month
         if "is_weekend" not in df_cached.columns:
@@ -157,13 +157,11 @@ def load_and_compile_data() -> pd.DataFrame:
         daily_agg = chunk.groupby(["date", "sku"])["sales"].sum().reset_index()
         fragmented_dfs.append(daily_agg)
 
-    # Unified sales concatenation
     unified_sales = pd.concat(fragmented_dfs, ignore_index=True)
     unified_sales = unified_sales.groupby(["date", "sku"])["sales"].sum().reset_index()
     unified_sales["date"] = pd.to_datetime(unified_sales["date"])
     unified_sales = unified_sales.sort_values("date")
 
-    # Relational merge with sku_master.csv on 'sku'
     sku_master_path = "sku_master.csv"
     if os.path.exists(sku_master_path):
         sku_master = pd.read_csv(sku_master_path, sep="|", low_memory=False, dtype={"SKUCode": str})
@@ -188,12 +186,10 @@ def load_and_compile_data() -> pd.DataFrame:
         compiled_df["category"] = "General"
         compiled_df["SKU_Description"] = compiled_df["sku"]
 
-    # Fill missing days with 0.0 and generate time-based multivariate features
     compiled_df["sales"] = compiled_df["sales"].fillna(0.0)
     compiled_df["month"] = compiled_df["date"].dt.month
     compiled_df["is_weekend"] = compiled_df["date"].dt.dayofweek.isin([5, 6]).astype(int)
 
-    # Accurate pricing and revenue mapping
     if "price" not in compiled_df.columns or compiled_df["price"].isnull().all():
         price_tiers = np.array([499.0, 699.0, 799.0, 999.0, 1199.0, 1499.0])
         sku_hashes = compiled_df["sku"].astype(str).apply(lambda s: abs(hash(s)) % len(price_tiers))
@@ -202,8 +198,6 @@ def load_and_compile_data() -> pd.DataFrame:
         compiled_df["price"] = pd.to_numeric(compiled_df["price"], errors="coerce").fillna(799.0)
 
     compiled_df["revenue"] = compiled_df["sales"] * compiled_df["price"]
-
-    # Persist cache
     compiled_df.to_parquet(cache_file, index=False)
     return compiled_df
 
@@ -228,11 +222,9 @@ def compute_abc_classification(df: pd.DataFrame) -> dict:
     if tot_rev <= 0 or tot_vol <= 0:
         return {s: "Class B" for s in sku_stats["sku"]}
 
-    # Revenue Pareto rank
     sku_stats = sku_stats.sort_values(by="revenue", ascending=False)
     sku_stats["cum_rev"] = sku_stats["revenue"].cumsum() / tot_rev
 
-    # Volume Pareto rank
     sku_stats = sku_stats.sort_values(by="sales", ascending=False)
     sku_stats["cum_vol"] = sku_stats["sales"].cumsum() / tot_vol
 
@@ -266,18 +258,20 @@ def train_and_forecast_xgboost(
     context_df: pd.DataFrame,
     target_col: str,
     future_dates: list,
-    future_promos: np.ndarray,
+    future_peaks: np.ndarray,
+    future_pres: np.ndarray,
     is_weekly: bool = False
 ) -> np.ndarray:
     """
-    Trains an XGBoost Regressor using month, weekend flag, real promotional covariate,
-    and lag/rolling average features.
+    Trains an XGBoost Regressor using month, weekend flag, dual promotional covariates
+    (peak_event_flag and pre_event_flag), and lag/rolling average features.
     Supports both Daily (1d, 7d, 14d lags) and Weekly (1w, 2w, 4w lags) series.
     Recursive multi-step forecasting loop.
     """
     df_sorted = context_df.sort_values("date").reset_index(drop=True)
     vals = df_sorted[target_col].values.astype(np.float32)
-    promos = df_sorted["promo_flag"].values.astype(np.float32)
+    peaks = df_sorted["peak_event_flag"].values.astype(np.float32)
+    pres = df_sorted["pre_event_flag"].values.astype(np.float32)
     n = len(vals)
     horizon = len(future_dates)
 
@@ -295,7 +289,8 @@ def train_and_forecast_xgboost(
         feat = [
             row_date.month,
             0 if is_weekly else int(row_date.dayofweek in [5, 6]),
-            float(promos[i]),
+            float(peaks[i]),
+            float(pres[i]),
             float(vals[i - lag_steps[0]]),
             float(vals[i - lag_steps[1]]),
             float(vals[i - lag_steps[2]]),
@@ -320,11 +315,13 @@ def train_and_forecast_xgboost(
     curr_history = list(vals)
     predictions = []
     for idx, f_date in enumerate(future_dates):
-        p_flag = float(future_promos[idx]) if idx < len(future_promos) else 0.0
+        peak_val = float(future_peaks[idx]) if idx < len(future_peaks) else 0.0
+        pre_val = float(future_pres[idx]) if idx < len(future_pres) else 0.0
         feat_vec = np.array([[
             f_date.month,
             0 if is_weekly else int(f_date.dayofweek in [5, 6]),
-            p_flag,
+            peak_val,
+            pre_val,
             float(curr_history[-lag_steps[0]]),
             float(curr_history[-lag_steps[1]] if len(curr_history) >= lag_steps[1] else curr_history[-1]),
             float(curr_history[-lag_steps[2]] if len(curr_history) >= lag_steps[2] else curr_history[-1]),
@@ -424,14 +421,12 @@ def compute_safety_stock_rop(
 # ==============================================================================
 st.sidebar.subheader("Configuration Panel")
 
-# View Metric: Sales Units vs Expected Revenue
 view_mode = st.sidebar.radio(
     "Target Analysis Metric",
     ["Sales Units", "Expected Revenue"],
     help="Toggle between physical volume demand (Units) and monetary financial value (Revenue)."
 )
 
-# Dashboard Mode Selection
 dashboard_mode = st.sidebar.selectbox(
     "Operating Mode",
     ["Live Future Forecast", "Historical Validation (Backtesting)"],
@@ -441,7 +436,6 @@ dashboard_mode = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.subheader("Catalog Hierarchy Filters")
 
-# Cascading Filter 0: SKU Class Filter (Default "ALL")
 class_options = ["ALL", "Class A", "Class B", "Class C"]
 selected_class = st.sidebar.selectbox(
     "SKU Class Filter",
@@ -455,11 +449,9 @@ if selected_class == "ALL":
 else:
     class_filtered_df = compiled_df[compiled_df["sku_class"] == selected_class]
 
-# Cascading Filter 1: Brand (Default "All")
 brands_available = ["All"] + sorted(class_filtered_df["brand"].dropna().unique().tolist())
 selected_brand = st.sidebar.selectbox("Brand Filter", brands_available, index=0)
 
-# Cascading Filter 2: Category (Default "All")
 if selected_brand == "All":
     cat_df = class_filtered_df
 else:
@@ -467,7 +459,6 @@ else:
 categories_available = ["All"] + sorted(cat_df["category"].dropna().unique().tolist())
 selected_category = st.sidebar.selectbox("Category Filter", categories_available, index=0)
 
-# Cascading Filter 3: SKU (Default "All")
 if selected_category == "All":
     sku_df = cat_df
 else:
@@ -534,7 +525,6 @@ if selected_sku == "All":
     sku_cat = selected_category if selected_category != "All" else "All Categories"
     sku_desc = f"Consolidated {selected_class if selected_class != 'ALL' else 'Portfolio'} ({len(top_skus):,} Active SKUs)"
 
-    # Dynamic sum across all SKUs in filtered dataset
     sku_daily = (
         active_sku_data.groupby("date")[["sales", "revenue"]]
         .sum()
@@ -575,8 +565,10 @@ sku_daily["price"] = sku_daily["price"].fillna(active_price)
 sku_daily["month"] = sku_daily["date"].dt.month
 sku_daily["is_weekend"] = sku_daily["date"].dt.dayofweek.isin([5, 6]).astype(int)
 
-# Real calendar promotional covariate (Daily)
-sku_daily["promo_flag"] = generate_real_promo_covariate(sku_daily["date"])
+# Dual promotional covariates (Daily)
+d_peak, d_pre = generate_dual_promo_covariates(sku_daily["date"])
+sku_daily["peak_event_flag"] = d_peak
+sku_daily["pre_event_flag"] = d_pre
 
 # -----------------------------------------------------------------------------
 # Class-Based Strategy Routing (Class A: Daily | Class B & C: Weekly W-MON)
@@ -585,7 +577,6 @@ is_class_b = (sku_class == "Class B" or (selected_sku == "All" and selected_clas
 is_class_c = (sku_class == "Class C" or (selected_sku == "All" and selected_class == "Class C"))
 is_class_a = (sku_class == "Class A" or (selected_sku == "All" and selected_class == "Class A"))
 
-# Check zero-demand truncation status (> 60 days zero sales) for Class C
 is_discontinued = False
 if is_class_c:
     if dashboard_mode == "Historical Validation (Backtesting)":
@@ -594,7 +585,6 @@ if is_class_c:
     else:
         is_discontinued = check_discontinued(sku_daily["sales"].values, threshold_days=60)
 
-# Visual Classification Badge styling
 if selected_sku == "All":
     badge_html = (
         '<span style="background-color: #1e3a8a; color: #ffffff; padding: 3px 9px; '
@@ -611,7 +601,7 @@ elif sku_class == "Class A":
     badge_html = (
         '<span style="background-color: #166534; color: #ffffff; padding: 3px 9px; '
         'border-radius: 4px; font-weight: 600; font-size: 0.82rem; margin-left: 8px;">'
-        'Class A - High Volume / Revenue (Daily TimesFM-3 + Promo Covariates)</span>'
+        'Class A - High Volume / Revenue (Daily TimesFM-3 + Dual Promo Covariates)</span>'
     )
 elif sku_class == "Class B":
     badge_html = (
@@ -628,11 +618,10 @@ else:
 
 st.markdown(f"**Active Selection:** `{selected_sku}` {badge_html}", unsafe_allow_html=True)
 
-# Granularity Aggregation: Weekly W-MON for Class B & C, Daily for Class A & Portfolio
 if is_class_b:
     st.info(
         "Class B Segment Strategy Active: Daily series aggregated into Weekly buckets (W-MON) "
-        "to eliminate high-frequency intermittency and noise. TimesFM 3.0 weekly neural inference and promotional covariates enabled."
+        "to eliminate high-frequency intermittency and noise. TimesFM 3.0 weekly neural inference and dual promotional covariates enabled."
     )
     sku_series = (
         sku_daily.set_index("date")
@@ -642,7 +631,9 @@ if is_class_b:
     )
     sku_series["month"] = sku_series["date"].dt.month
     sku_series["is_weekend"] = 0
-    sku_series["promo_flag"] = generate_weekly_promo_covariate(sku_series["date"])
+    w_peak, w_pre = generate_weekly_dual_covariates(sku_series["date"])
+    sku_series["peak_event_flag"] = w_peak
+    sku_series["pre_event_flag"] = w_pre
     time_grain_label = "Weekly"
 elif is_class_c:
     st.info(
@@ -657,19 +648,18 @@ elif is_class_c:
     )
     sku_series["month"] = sku_series["date"].dt.month
     sku_series["is_weekend"] = 0
-    sku_series["promo_flag"] = generate_weekly_promo_covariate(sku_series["date"])
+    w_peak, w_pre = generate_weekly_dual_covariates(sku_series["date"])
+    sku_series["peak_event_flag"] = w_peak
+    sku_series["pre_event_flag"] = w_pre
     time_grain_label = "Weekly"
 else:
-    # Class A or Portfolio Aggregate -> Daily resolution
     sku_series = sku_daily
     time_grain_label = "Daily"
 
-# Target column and display formatting based on View Mode
 target_col = "revenue" if view_mode == "Expected Revenue" else "sales"
 curr_symbol = "₹" if view_mode == "Expected Revenue" else ""
 unit_suffix = "" if view_mode == "Expected Revenue" else " units"
 
-# TimesFM decile quantiles [0.1, 0.2, ..., 0.9]
 deciles = np.linspace(0.1, 0.9, 9)
 alpha_ci = (100.0 - confidence_interval) / 200.0
 low_idx = int(np.clip(np.argmin(np.abs(deciles - alpha_ci)), 0, 8))
@@ -689,23 +679,23 @@ if dashboard_mode == "Live Future Forecast":
     if time_grain_label == "Weekly":
         horizon_steps = max(2, int(np.ceil(horizon_days / 7.0)))
         future_dates = [last_hist_date + datetime.timedelta(weeks=i) for i in range(1, horizon_steps + 1)]
-        future_promos = generate_weekly_promo_covariate(future_dates)
+        future_peaks, future_pres = generate_weekly_dual_covariates(future_dates)
     else:
         horizon_steps = horizon_days
         future_dates = [last_hist_date + datetime.timedelta(days=i) for i in range(1, horizon_steps + 1)]
-        future_promos = generate_real_promo_covariate(future_dates)
+        future_peaks, future_pres = generate_dual_promo_covariates(future_dates)
 
-    past_future_promo = np.concatenate([
-        sku_series["promo_flag"].values.astype(np.float32),
-        future_promos.astype(np.float32)
+    past_future_covariates = np.stack([
+        np.concatenate([sku_series["peak_event_flag"].values.astype(np.float32), future_peaks.astype(np.float32)]),
+        np.concatenate([sku_series["pre_event_flag"].values.astype(np.float32), future_pres.astype(np.float32)])
     ])
 
     with st.spinner(f"Computing multi-model projections for {horizon_steps} {time_grain_label.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Real Promo Covariates
+        # 1. TimesFM 3.0 MLX Native Inference with Dual Promo Covariates (peak & pre)
         tfm_out = timesfm_model.predict(
             historical_array,
             horizon=horizon_steps,
-            past_future_covariates=past_future_promo,
+            past_future_covariates=past_future_covariates,
             padding_mode="edge",
             return_quantiles=True
         )
@@ -714,9 +704,9 @@ if dashboard_mode == "Live Future Forecast":
         tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
         tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
-        # 2. XGBoost Multivariate Regressor with Promotional Covariate
+        # 2. XGBoost Multivariate Regressor with Dual Promo Covariates
         xgb_pred = train_and_forecast_xgboost(
-            sku_series, target_col, future_dates, future_promos, is_weekly=(time_grain_label == "Weekly")
+            sku_series, target_col, future_dates, future_peaks, future_pres, is_weekly=(time_grain_label == "Weekly")
         )
 
         # 3. SBA Croston Intermittent with Zero-Demand Truncation
@@ -727,7 +717,6 @@ if dashboard_mode == "Live Future Forecast":
             is_discontinued=is_discontinued
         )
 
-        # Zero-Demand Truncation: override forecast output to 0 if Class C SKU has 0 sales > 60 days
         if is_class_c and is_discontinued:
             timesfm_pred = np.zeros(horizon_steps, dtype=np.float32)
             tfm_lower = np.zeros(horizon_steps, dtype=np.float32)
@@ -735,7 +724,6 @@ if dashboard_mode == "Live Future Forecast":
             xgb_pred = np.zeros(horizon_steps, dtype=np.float32)
             croston_pred = np.zeros(horizon_steps, dtype=np.float32)
 
-    # Primary Metric Summary Widgets inside Container Layout
     tot_sales_baseline = float(np.sum(sku_series["sales"].values))
     tot_revenue_proj = float(np.sum(timesfm_pred if view_mode == "Expected Revenue" else timesfm_pred * active_price))
     tot_tfm = float(np.sum(timesfm_pred))
@@ -748,7 +736,6 @@ if dashboard_mode == "Live Future Forecast":
         m3.metric(f"TimesFM Projected ({time_grain_label})", f"{curr_symbol}{tot_tfm:,.0f}{unit_suffix}")
         m4.metric(f"XGBoost Projected ({time_grain_label})", f"{curr_symbol}{tot_xgb:,.0f}{unit_suffix}")
 
-    # Class C Reorder Point and Safety Stock Safeguard Presentation
     if is_class_c:
         unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
         unit_std = demand_std if view_mode == "Sales Units" else (demand_std / active_price if active_price > 0 else 0.0)
@@ -792,17 +779,17 @@ else:
 
     dynamic_horizon = len(truth_df)
 
-    past_future_promo = np.concatenate([
-        context_df["promo_flag"].values.astype(np.float32),
-        truth_df["promo_flag"].values.astype(np.float32)
+    past_future_covariates = np.stack([
+        np.concatenate([context_df["peak_event_flag"].values.astype(np.float32), truth_df["peak_event_flag"].values.astype(np.float32)]),
+        np.concatenate([context_df["pre_event_flag"].values.astype(np.float32), truth_df["pre_event_flag"].values.astype(np.float32)])
     ])
 
     with st.spinner(f"Executing validation benchmark across {dynamic_horizon} {time_grain_label.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Real Promo Covariates
+        # 1. TimesFM 3.0 MLX Native Inference with Dual Promo Covariates (peak & pre)
         tfm_out = timesfm_model.predict(
             context_array,
             horizon=dynamic_horizon,
-            past_future_covariates=past_future_promo,
+            past_future_covariates=past_future_covariates,
             padding_mode="edge",
             return_quantiles=True
         )
@@ -811,12 +798,13 @@ else:
         tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
         tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
-        # 2. XGBoost Multivariate Regressor with Promotional Covariate
+        # 2. XGBoost Multivariate Regressor with Dual Promo Covariates
         xgb_pred = train_and_forecast_xgboost(
             context_df,
             target_col,
             list(truth_df["date"]),
-            truth_df["promo_flag"].values.astype(np.float32),
+            truth_df["peak_event_flag"].values.astype(np.float32),
+            truth_df["pre_event_flag"].values.astype(np.float32),
             is_weekly=(time_grain_label == "Weekly")
         )
 
@@ -828,7 +816,6 @@ else:
             is_discontinued=is_discontinued
         )
 
-        # Zero-Demand Truncation: override forecast output to 0 if Class C SKU has 0 sales > 60 days
         if is_class_c and is_discontinued:
             timesfm_pred = np.zeros(dynamic_horizon, dtype=np.float32)
             tfm_lower = np.zeros(dynamic_horizon, dtype=np.float32)
@@ -836,7 +823,6 @@ else:
             xgb_pred = np.zeros(dynamic_horizon, dtype=np.float32)
             croston_pred = np.zeros(dynamic_horizon, dtype=np.float32)
 
-    # Compute Validation Benchmark Metrics dynamically on aggregated totals
     sum_truth = float(max(np.sum(truth_array), 1.0))
 
     def evaluate_model(preds: np.ndarray):
@@ -854,7 +840,6 @@ else:
     tot_sales_baseline = float(np.sum(context_df["sales"].values))
     tot_revenue_proj = float(np.sum(timesfm_pred if view_mode == "Expected Revenue" else timesfm_pred * active_price))
 
-    # Primary Metric Summary Widgets inside Container Layout
     with st.container(border=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sales Volume Baseline", f"{tot_sales_baseline:,.0f} units")
@@ -862,7 +847,6 @@ else:
         m3.metric("TimesFM Validation Accuracy", f"{tfm_acc:.1f}%")
         m4.metric("TimesFM Error Margin (WAPE)", f"{tfm_wape * 100:.1f}%")
 
-    # Class C Reorder Point and Safety Stock Safeguard Presentation
     if is_class_c:
         unit_rate = sba_rate if view_mode == "Sales Units" else (sba_rate / active_price if active_price > 0 else 0.0)
         unit_std = demand_std if view_mode == "Sales Units" else (demand_std / active_price if active_price > 0 else 0.0)
@@ -885,7 +869,6 @@ else:
                 "Inactive / Discontinued (Zero Truncation)" if is_discontinued else "Active Intermittent Demand"
             )
 
-    # Historical Validation & Model Performance Matrix
     st.subheader(f"Historical Validation & Model Performance Matrix ({cutoff_date_str} to 2025-12-31)")
 
     benchmark_data = [
@@ -898,7 +881,7 @@ else:
             "Actual Ground Truth Sum": f"{curr_symbol}{sum_truth:,.0f}{unit_suffix}"
         },
         {
-            "Model Architecture": "XGBoost Regressor (Multivariate + Promo)",
+            "Model Architecture": "XGBoost Regressor (Multivariate + Dual Promo)",
             "Prediction Accuracy": f"{xgb_acc:.1f}%",
             "WAPE (Error Margin)": f"{xgb_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{xgb_mae:,.1f}{unit_suffix}",
@@ -916,7 +899,6 @@ else:
     ]
     st.table(pd.DataFrame(benchmark_data))
 
-    # Enterprise Accuracy Benchmark Breakdown by SKU Segment Class
     st.subheader("Accuracy Benchmark Breakdown by SKU Segment Class")
     st.caption("Class-level macroeconomic backtesting benchmarks across the portfolio (Validation Period to 2025-12-31):")
 
@@ -929,7 +911,7 @@ else:
         sfx = "" if metric_mode == "Expected Revenue" else " units"
 
         configs = [
-            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Promo Covariates", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
+            ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Dual Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
             ("Class B Segment", "Class B", "Google TimesFM 3.0 (MLX)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
             ("Class C Segment", "Class C", "SBA Intermittent Method (Syntetos-Boylan)", "Weekly (W-MON)", "Reorder Point (ROP) & Safety Stock Safeguards")
         ]
@@ -942,9 +924,13 @@ else:
 
             if "Weekly" in res:
                 sub = sub.set_index("date").resample("W-MON").sum().reset_index()
-                sub["promo_flag"] = generate_weekly_promo_covariate(sub["date"])
+                w_pk, w_pr = generate_weekly_dual_covariates(sub["date"])
+                sub["peak_event_flag"] = w_pk
+                sub["pre_event_flag"] = w_pr
             else:
-                sub["promo_flag"] = generate_real_promo_covariate(sub["date"])
+                d_pk, d_pr = generate_dual_promo_covariates(sub["date"])
+                sub["peak_event_flag"] = d_pk
+                sub["pre_event_flag"] = d_pr
 
             c_df = sub[sub["date"] <= c_dt]
             t_df = sub[(sub["date"] > c_dt) & (sub["date"] <= v_dt)]
@@ -953,7 +939,10 @@ else:
 
             c_vals = c_df[col].values.astype(np.float32)
             t_vals = t_df[col].values.astype(np.float32)
-            p_cov = sub["promo_flag"].values.astype(np.float32)
+            p_cov = np.stack([
+                sub["peak_event_flag"].values.astype(np.float32),
+                sub["pre_event_flag"].values.astype(np.float32)
+            ])
             h_len = len(t_vals)
             s_truth = float(max(np.sum(t_vals), 1.0))
 
@@ -995,7 +984,6 @@ fig = go.Figure()
 num_fmt = ":,.1f" if view_mode == "Expected Revenue" else ":,.1f"
 
 if dashboard_mode == "Historical Validation (Backtesting)":
-    # 1. Historical Context Baseline (Blue)
     fig.add_trace(go.Scatter(
         x=context_dates,
         y=context_array,
@@ -1005,7 +993,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>Historical Context</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 2. Actual Real Sales Ground Truth (Green)
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=truth_array,
@@ -1015,7 +1002,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>Actual Real Sales</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 3. TimesFM Forecast (Dashed Orange)
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=timesfm_pred,
@@ -1025,7 +1011,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>TimesFM Forecast</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # TimesFM Bounds: tonexty Shaded Confidence Interval Trace
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=tfm_lower,
@@ -1046,7 +1031,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hoverinfo="skip"
     ))
 
-    # 4. XGBoost Multivariate (Dashed Purple)
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=xgb_pred,
@@ -1056,7 +1040,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 5. SBA Croston Intermittent (Dashed Red)
     fig.add_trace(go.Scatter(
         x=truth_dates,
         y=croston_pred,
@@ -1066,7 +1049,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # Cutoff Vertical Marker
     fig.add_vline(
         x=pd.to_datetime(cutoff_date_str).timestamp() * 1000,
         line_width=1.5,
@@ -1082,10 +1064,6 @@ if dashboard_mode == "Historical Validation (Backtesting)":
     )
 
 else:
-    # -------------------------------------------------------------------------
-    # Mode A Plotly Traces: Live Future Forecast
-    # -------------------------------------------------------------------------
-    # 1. Historical Context Baseline (Blue)
     fig.add_trace(go.Scatter(
         x=historical_dates,
         y=historical_array,
@@ -1102,7 +1080,6 @@ else:
     conn_low = np.concatenate([[historical_array[-1]], tfm_lower])
     conn_high = np.concatenate([[historical_array[-1]], tfm_upper])
 
-    # 2. TimesFM Forecast (Dashed Orange)
     fig.add_trace(go.Scatter(
         x=conn_dates,
         y=conn_tfm,
@@ -1112,7 +1089,6 @@ else:
         hovertemplate=f"<b>TimesFM Forecast</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # TimesFM Bounds: tonexty Shaded Confidence Interval Trace
     fig.add_trace(go.Scatter(
         x=conn_dates,
         y=conn_low,
@@ -1133,7 +1109,6 @@ else:
         hoverinfo="skip"
     ))
 
-    # 3. XGBoost Multivariate (Dashed Purple)
     fig.add_trace(go.Scatter(
         x=conn_dates,
         y=conn_xgb,
@@ -1143,7 +1118,6 @@ else:
         hovertemplate=f"<b>XGBoost Multivariate</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # 4. SBA Croston Intermittent (Dashed Red)
     fig.add_trace(go.Scatter(
         x=conn_dates,
         y=conn_crs,
@@ -1153,7 +1127,6 @@ else:
         hovertemplate=f"<b>SBA Croston</b><br>Date: %{{x|%Y-%m-%d}}<br>Value: {curr_symbol}%{{y{num_fmt}}}{unit_suffix}<extra></extra>"
     ))
 
-    # Forecast Horizon Start Vertical Marker
     fig.add_vline(
         x=last_hist_date.timestamp() * 1000,
         line_width=1.5,
@@ -1168,7 +1141,6 @@ else:
         f"{selected_sku} | {sku_desc[:35]} ({view_mode})"
     )
 
-# Layout: Native Pan/Zoom, Synchronized Hover Cursor, and Range Slider
 fig.update_layout(
     title=dict(text=chart_title, font=dict(size=14, color="#0f172a")),
     xaxis=dict(
@@ -1209,6 +1181,8 @@ if dashboard_mode == "Historical Validation (Backtesting)":
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
+        "peak_event_flag": truth_df["peak_event_flag"].values,
+        "pre_event_flag": truth_df["pre_event_flag"].values,
         f"actual_{target_col}": np.round(truth_array, 1),
         f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
         f"xgboost_{target_col}": np.round(xgb_pred, 1),
@@ -1226,6 +1200,8 @@ else:
         "brand": sku_brand,
         "category": sku_cat,
         "unit_price": active_price,
+        "peak_event_flag": future_peaks,
+        "pre_event_flag": future_pres,
         f"timesfm3_{target_col}": np.round(timesfm_pred, 1),
         f"xgboost_{target_col}": np.round(xgb_pred, 1),
         f"sba_croston_{target_col}": np.round(croston_pred, 1),
