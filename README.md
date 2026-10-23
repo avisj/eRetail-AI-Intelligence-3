@@ -1,131 +1,224 @@
 # Enterprise Demand Intelligence Workspace
 
-An enterprise-grade, multi-model demand intelligence, inventory optimization, and financial projection platform engineered for retail supply chains. Powered by **Google TimesFM 3.0 Foundation Model (MLX / PyTorch)**, **XGBoost Multivariate Regressor**, and **Syntetos-Boylan Approximation (SBA) Intermittent Demand Baseline**, featuring real-time interactive analytics via **Streamlit** and **Plotly**.
+An enterprise-grade, multi-model demand intelligence, inventory optimization, and financial projection platform engineered for retail supply chains. Powered by Google TimesFM 3.0 Foundation Model, this workspace combines forecasting, segmentation, planning, and operational recommendations into a single interactive Streamlit application.
 
 ---
 
-## Technical Highlights & Key Capabilities
+## What this project does
 
-- **Zero-Shot Foundation Forecasting (Google TimesFM 3.0):** Ingests historical context vectors and dual 2D promotional covariate tensors (`peak_event_flag`, `pre_event_flag`) with quantile uncertainty interval bands (50% to 95% Confidence Interval).
-- **Cross-Platform Hardware Acceleration:**
-  - **macOS (Apple Silicon):** Native MLX unified memory and Metal Performance Shaders acceleration.
-  - **Windows / Linux (NVIDIA CUDA):** High-throughput PyTorch CUDA acceleration on NVIDIA Tensor Cores.
-  - **CPU (Intel / AMD):** Optimized vectorized OpenMP and Intel MKL multi-threading fallback.
-- **Dual-Criteria Multi-Metric ABC/XYZ Segmentation:** Evaluates SKUs across **both** Cumulative Revenue (80/15/5%) and Cumulative Unit Volume (80/15/5%), preventing high-volume, low-MRP essentials from being miscategorized.
-- **Verified Indian E-Commerce Promotional Covariates (2023–2025):** Weighted event magnitude multipliers (Tier 1 Megasales: 3.5x, Tier 2 Major Festive: 2.0x, Tier 3 National Sales: 1.0x, Pre-Event Cannibalization Buffer: 0.5x).
-- **Intermittent Demand Safeguards (Class C):** 60-day zero-demand truncation for discontinued items, Syntetos-Boylan Approximation (SBA) bias removal, and parametric Reorder Point (ROP) / Safety Stock buffer calculations.
-- **Dynamic Portfolio Resolution Toggle:** Real-time on-the-fly resampling across **Daily**, **Weekly (`W-MON`)**, and **Monthly (`MS`)** resolutions with instant metric recalculation.
-- **Enterprise Accuracy Benchmarks:** Evaluated using Weighted Absolute Percentage Error (WAPE), Mean Absolute Error (MAE), and Validation Accuracy % across chronological cutoff dates (`2024-12-31` and `2025-06-30`).
+- Forecast demand using Google TimesFM 3.0
+- Optimize inventory and recommendation logic using SKU and sales data
+- Segment products using ABC/XYZ analysis
+- Backtest and validate historical performance
+- Provide a browser-based dashboard for operational teams
 
 ---
 
-## Platform & Hardware Support Matrix
+## Supported platforms
 
-| Operating System | Hardware Architecture | TimesFM 3.0 Backend | Acceleration Engine | Setup Guide |
-| :--- | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | NVIDIA GPU (RTX / GTX / Tesla) | `timesfm3.torch` | NVIDIA CUDA 12.1 / cuDNN | [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md) |
-| **Windows 10 / 11 (64-bit)** | Intel / AMD CPU | `timesfm3.torch` | Intel MKL / AVX-512 / OpenMP | [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md) |
-| **macOS (Apple Silicon)** | M1 / M2 / M3 / M4 | `timesfm3.mlx` | Apple Silicon MLX / Metal MPS | [macOS Setup Instructions](#macos--linux-setup-instructions) |
-| **Linux (Ubuntu / RHEL)** | NVIDIA GPU / Cloud Instance | `timesfm3.torch` | NVIDIA CUDA / cuDNN | [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md) |
+| Operating System | Hardware | Recommended Setup |
+| :--- | :--- | :--- |
+| Windows 10 / 11 | NVIDIA GPU or CPU | Python 3.11 + venv + PyTorch |
+| macOS | Apple Silicon (M1/M2/M3/M4) | Python 3.11 + venv + MLX/PyTorch fallback |
+| Linux | NVIDIA GPU or CPU | Python 3.11 + venv + PyTorch |
 
 ---
 
-## Installation & Setup
+## Quick start (Windows)
 
-### Windows Installation Guide
-For a complete, step-by-step guide on configuring Python, Visual Studio C++ Build Tools, PyTorch with CUDA support, and handling Windows permissions, please refer directly to:
-👉 **[Read the Complete Windows Installation Guide (`WINDOWS_INSTALLATION.md`)](WINDOWS_INSTALLATION.md)**
+### 1) Install prerequisites
 
-#### Windows Quick Start (PowerShell):
+Download and install:
+- Python 3.11 from https://www.python.org/downloads/windows/
+- Git from https://git-scm.com/download/win
+- Visual Studio Build Tools if you plan to compile native dependencies or run a full Windows build environment
+
+Important: when installing Python, check `Add python.exe to PATH`.
+
+### 2) Clone the repository
+
 ```powershell
-# 1. Clone repository
 git clone https://github.com/avisj/eRetail-AI-Intelligence-3.git
 cd eRetail-AI-Intelligence-3
+```
 
-# 2. Create and activate virtual environment
+### 3) Create and activate a virtual environment
+
+```powershell
 python -m venv venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\venv\Scripts\Activate.ps1
+```
 
-# 3. Install PyTorch (CUDA 12.1 for NVIDIA GPU or CPU fallback)
-# For NVIDIA GPU:
+### 4) Install PyTorch
+
+Choose the option that matches your hardware:
+
+GPU (recommended):
+```powershell
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# For CPU-only:
-# pip install torch torchvision torchaudio
+```
 
-# 4. Install repository dependencies
+CPU only:
+```powershell
+pip install torch torchvision torchaudio
+```
+
+### 5) Install project dependencies
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+```
 
-# 5. Launch dashboard
+### 6) Run the app
+
+```powershell
 streamlit run app.py
+```
+
+Then open the local URL shown in the terminal, usually:
+
+```text
+http://localhost:8501
 ```
 
 ---
 
-### macOS / Linux Setup Instructions
+## Quick start (macOS)
 
-#### 1. Environment Configuration
-Ensure you have **Python 3.11** installed. Clone the repository and configure a clean virtual environment:
+### 1) Install prerequisites
+
+Make sure you have:
+- Python 3.11
+- Git
+
+Check versions:
 
 ```bash
-# Clone the repository
+python3 --version
+git --version
+```
+
+### 2) Clone the repository
+
+```bash
 git clone https://github.com/avisj/eRetail-AI-Intelligence-3.git
 cd eRetail-AI-Intelligence-3
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Upgrade packaging tools
-pip install --upgrade pip setuptools wheel
 ```
 
-#### 2. Install Dependencies
+### 3) Create and activate a virtual environment
+
 ```bash
-# Install dependencies (includes Apple Silicon MLX on macOS arm64)
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 4) Install dependencies
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-#### 3. Launch Dashboard
+On Apple Silicon Macs, the project installs the MLX dependencies automatically when supported by the platform.
+
+### 5) Run the app
+
 ```bash
 streamlit run app.py
 ```
 
-The application will launch and be available locally at `http://localhost:8501`.
+Then open:
 
----
-
-## Operating Modes
-
-1. **Live Future Forecast (Forward Projection):**
-   - Configurable planning horizons (7 to 180 calendar days).
-   - Generates multi-model baseline projections, confidence interval envelopes, and inventory replenishment recommendations.
-   - Interactive CSV export for operational ERP/WMS ingestion.
-
-2. **Historical Validation (Chronological Backtesting):**
-   - Select temporal validation boundaries: **`2024-12-31`** (365-day backtest) or **`2025-06-30`** (184-day backtest).
-   - Model parameters train strictly on pre-cutoff historical data; predictions are benchmarked against post-cutoff ground truth.
-   - Dynamic class-level macroeconomic table comparing **Class A (Daily TimesFM)**, **Class B (Weekly TimesFM)**, and **Class C (Weekly SBA Croston)**.
-
----
-
-## Repository Structure
-
+```text
+http://localhost:8501
 ```
+
+---
+
+## Common setup notes
+
+- Use Python 3.11 for best compatibility.
+- Do not use the system Python if you can avoid it; use a virtual environment.
+- The project uses a dependency file that includes platform-specific libraries for macOS and Windows.
+- First app launch may download model weights from Hugging Face. This can take some time depending on your internet connection.
+- If port 8501 is already in use, run:
+
+```bash
+streamlit run app.py --server.port 8502
+```
+
+---
+
+## Project structure
+
+```text
 eRetail-AI-Intelligence-3/
-├── app.py                         # Production Streamlit application & inference engine
-├── requirements.txt               # Cross-platform dependencies with platform markers
-├── ARCHITECTURE_AND_PIPELINE.md   # Exhaustive technical and mathematical architecture manual
-├── WINDOWS_INSTALLATION.md        # Comprehensive Windows 10/11 installation & troubleshooting
-├── client_sales_data.csv          # Sample schema dataset
-├── compiled_sales_data.parquet    # Columnar cache for sub-second database loads
-├── sku_master.csv                 # Relational catalog metadata & product attributes
-└── raw_sales_data/                # Fragmented client transaction records (pipe-delimited)
+├── app.py                         # Streamlit app and forecasting logic
+├── requirements.txt               # Python dependencies
+├── README.md                      # Setup and project overview
+├── WINDOWS_INSTALLATION.md        # Windows troubleshooting guide
+├── ARCHITECTURE_AND_PIPELINE.md   # Technical architecture docs
+├── client_sales_data.csv          # Example sales dataset
+├── sku_master.csv                 # SKU metadata and product catalog
+├── raw_sales_data/                # Input raw sales files
+└── compiled_sales_data.parquet    # Cached compiled data
 ```
 
 ---
 
-## Technical Documentation & Architecture Specification
+## Additional documentation
 
-For a comprehensive review of the algorithmic data flows, dual-criteria Pareto mathematics, TimesFM tensor ingestion schemas, SBA intermittent formulations, and backtest audit results, refer to:  
-📘 **[ARCHITECTURE_AND_PIPELINE.md](ARCHITECTURE_AND_PIPELINE.md)**
+- [WINDOWS_INSTALLATION.md](WINDOWS_INSTALLATION.md) — full Windows setup and troubleshooting guide
+- [ARCHITECTURE_AND_PIPELINE.md](ARCHITECTURE_AND_PIPELINE.md) — architecture and pipeline details
+
+---
+
+## Operating modes
+
+1. Live Future Forecast
+   - Configurable planning horizons
+   - Multi-model baseline projections
+   - Inventory and replenishment planning support
+
+2. Historical Validation
+   - Chronological backtesting
+   - Model validation on historical data
+   - KPI comparison and performance review
+
+---
+
+## Troubleshooting
+
+### Windows PowerShell execution policy issue
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+```
+
+### Missing Microsoft C++ runtime or build tools
+
+Install Visual Studio Build Tools and the C++ workloads required for native Python packages.
+
+### Port already in use
+
+```powershell
+streamlit run app.py --server.port 8502
+```
+
+### macOS dependency issues
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+```
+
+If you still run into problems, review the repository docs and ensure your Python version is 3.11.x.
+
+---
+
+## License
+
+This project is provided for research, internal evaluation, and operational experimentation. Please check the repository for any licensing or usage restrictions before deploying in production.
