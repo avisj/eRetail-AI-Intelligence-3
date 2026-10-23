@@ -7,7 +7,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import scipy.stats as stats
 import streamlit as st
-from timesfm3.mlx import TimesFM3Forecaster
+try:
+    from timesfm3.mlx import TimesFM3Forecaster
+except (ImportError, ModuleNotFoundError):
+    from timesfm3.torch import TimesFM3Forecaster
 import xgboost as xgb
 
 # ==============================================================================
