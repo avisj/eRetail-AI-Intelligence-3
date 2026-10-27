@@ -7,6 +7,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import scipy.stats as stats
 import streamlit as st
+import torch
+
+# Optimize PyTorch CPU vectorization and OpenMP thread concurrency
+_num_threads = max(1, (os.cpu_count() or 4) - 1)
+try:
+    torch.set_num_threads(_num_threads)
+except Exception:
+    pass
+
 try:
     from timesfm3.mlx import TimesFM3Forecaster
 except (ImportError, ModuleNotFoundError):
@@ -24,7 +33,7 @@ st.set_page_config(
 st.title("Enterprise Demand Intelligence Workspace")
 st.caption(
     "AI-powered multi-model time-series forecasting, financial projections, and "
-    "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and SBA Intermittent Demand."
+    "historical validation matrix benchmarking Google TimesFM 3.0 (MLX/Torch), XGBoost Multivariate, and SBA Intermittent Demand."
 )
 
 # ==============================================================================
@@ -111,7 +120,7 @@ def generate_weekly_dual_covariates(weekly_dates) -> tuple[np.ndarray, np.ndarra
 def resample_timeline(df_to_resample: pd.DataFrame, resolution_mode: str, date_col: str = "date") -> pd.DataFrame:
     """
     Dynamically resamples and aggregates numeric metrics in df_to_resample
-    according to resolution_mode: "Daily", "Weekly (W-MON)", or "Monthly (MS)".
+    according to resolution_mode: 'Daily', 'Weekly (W-MON)', or 'Monthly (MS)'.
     """
     if resolution_mode == "Daily" or df_to_resample.empty:
         return df_to_resample.copy()
@@ -121,144 +130,72 @@ def resample_timeline(df_to_resample: pd.DataFrame, resolution_mode: str, date_c
 
 
 # ==============================================================================
-# 2. Data Engineering Ingestion & Enrichment Layer (@st.cache_data)
+# 2. Optimized High-Speed Data Caching Layer
 # ==============================================================================
-@st.cache_data(show_spinner="Executing data ingestion pipeline...")
-def load_and_compile_data() -> pd.DataFrame:
-    """
-    Ingests fragmented daily sales records from 'raw_sales_data/', performs a relational
-    database merge with 'sku_master.csv' on 'sku', fills missing day sales with 0.0,
-    generates time-based multivariate features (month, is_weekend), and computes revenue.
-    """
+@st.cache_data(show_spinner="Loading catalog index...")
+def load_sku_summary() -> pd.DataFrame:
+    """Loads precomputed SKU summary and classification metadata in milliseconds."""
+    if os.path.exists("sku_summary.parquet"):
+        return pd.read_parquet("sku_summary.parquet")
+    # Fallback to computing if not found
+    raw = load_compiled_data()
+    stats_df = raw.groupby("sku", as_index=False).agg({
+        "sales": "sum", "revenue": "sum", "brand": "first",
+        "category": "first", "SKU_Description": "first", "price": "first"
+    })
+    tot_r = float(stats_df["revenue"].sum())
+    tot_v = float(stats_df["sales"].sum())
+    stats_df = stats_df.sort_values(by="revenue", ascending=False)
+    stats_df["cum_rev"] = stats_df["revenue"].cumsum() / max(tot_r, 1.0)
+    stats_df = stats_df.sort_values(by="sales", ascending=False)
+    stats_df["cum_vol"] = stats_df["sales"].cumsum() / max(tot_v, 1.0)
+    def assign_c(r):
+        if r["cum_rev"] <= 0.80 or r["cum_vol"] <= 0.80:
+            return "Class A"
+        elif r["cum_rev"] <= 0.95 or r["cum_vol"] <= 0.95:
+            return "Class B"
+        return "Class C"
+    stats_df["sku_class"] = stats_df.apply(assign_c, axis=1)
+    stats_df.drop(columns=["cum_rev", "cum_vol"], inplace=True)
+    stats_df.sort_values("sales", ascending=False, inplace=True)
+    stats_df.to_parquet("sku_summary.parquet", index=False)
+    return stats_df
+
+
+@st.cache_data(show_spinner=False)
+def load_class_daily_aggregates() -> pd.DataFrame:
+    """Loads pre-aggregated daily portfolio time-series in sub-milliseconds."""
+    if os.path.exists("class_daily_aggregates.parquet"):
+        df = pd.read_parquet("class_daily_aggregates.parquet")
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    # Fallback
+    raw = load_compiled_data()
+    all_d = raw.groupby("date", as_index=False)[["sales", "revenue"]].sum()
+    all_d["sku_class"] = "ALL"
+    cls_d = raw.groupby(["date", "sku_class"], as_index=False)[["sales", "revenue"]].sum()
+    comb = pd.concat([all_d, cls_d], ignore_index=True)
+    comb.to_parquet("class_daily_aggregates.parquet", index=False)
+    return comb
+
+
+@st.cache_data(show_spinner="Reading transactions cache...")
+def load_compiled_data() -> pd.DataFrame:
+    """Loads the full transactions parquet cache when deep SKU filtering is required."""
     cache_file = "compiled_sales_data.parquet"
     if os.path.exists(cache_file):
         df_cached = pd.read_parquet(cache_file)
         df_cached["date"] = pd.to_datetime(df_cached["date"])
+        return df_cached
+    st.error("compiled_sales_data.parquet not found.")
+    st.stop()
 
-        if "month" not in df_cached.columns:
-            df_cached["month"] = df_cached["date"].dt.month
-        if "is_weekend" not in df_cached.columns:
-            df_cached["is_weekend"] = df_cached["date"].dt.dayofweek.isin([5, 6]).astype(int)
-        if "price" not in df_cached.columns or df_cached["price"].isnull().any():
-            price_tiers = np.array([499.0, 699.0, 799.0, 999.0, 1199.0, 1499.0])
-            sku_hashes = df_cached["sku"].astype(str).apply(lambda s: abs(hash(s)) % len(price_tiers))
-            df_cached["price"] = price_tiers[sku_hashes]
-        if "revenue" not in df_cached.columns:
-            df_cached["revenue"] = df_cached["sales"] * df_cached["price"]
 
-        return df_cached.sort_values("date")
+# Load high-speed precomputed layers
+sku_summary_df = load_sku_summary()
+class_daily_df = load_class_daily_aggregates()
+sku_class_map = dict(zip(sku_summary_df["sku"], sku_summary_df["sku_class"]))
 
-    raw_dir = "raw_sales_data"
-    if not os.path.exists(raw_dir):
-        st.error(f"Directory '{raw_dir}' not found.")
-        st.stop()
-
-    file_list = sorted([f for f in os.listdir(raw_dir) if f.endswith(".csv")])
-    if not file_list:
-        st.error(f"No fragmented sales files found in '{raw_dir}'.")
-        st.stop()
-
-    fragmented_dfs = []
-    for f in file_list:
-        file_path = os.path.join(raw_dir, f)
-        chunk = pd.read_csv(
-            file_path,
-            sep="|",
-            quoting=csv.QUOTE_NONE,
-            usecols=["order_date", "sku_id", "order_qty"],
-            dtype={"sku_id": str},
-            low_memory=False
-        )
-        chunk["date"] = chunk["order_date"].astype(str).str.slice(0, 10)
-        chunk["sku"] = chunk["sku_id"].astype(str)
-        chunk["sales"] = pd.to_numeric(chunk["order_qty"], errors="coerce").fillna(0.0)
-        daily_agg = chunk.groupby(["date", "sku"])["sales"].sum().reset_index()
-        fragmented_dfs.append(daily_agg)
-
-    unified_sales = pd.concat(fragmented_dfs, ignore_index=True)
-    unified_sales = unified_sales.groupby(["date", "sku"])["sales"].sum().reset_index()
-    unified_sales["date"] = pd.to_datetime(unified_sales["date"])
-    unified_sales = unified_sales.sort_values("date")
-
-    sku_master_path = "sku_master.csv"
-    if os.path.exists(sku_master_path):
-        sku_master = pd.read_csv(sku_master_path, sep="|", low_memory=False, dtype={"SKUCode": str})
-        sku_master["sku"] = sku_master["SKUCode"].astype(str)
-
-        desc_col = sku_master["SKU_Description"].fillna("")
-        extracted_brand = desc_col.apply(lambda s: s.split(":")[0].strip() if ":" in s else "The Souled Store")
-        sku_master["brand"] = sku_master["Brand_Name"].fillna(extracted_brand).fillna("The Souled Store")
-        sku_master["category"] = sku_master["Cat_L1"].fillna(sku_master["Last_Cat"]).fillna("Apparel")
-
-        if "price" in sku_master.columns:
-            sku_meta = sku_master[["sku", "brand", "category", "SKU_Description", "price"]].drop_duplicates(subset=["sku"])
-        else:
-            sku_meta = sku_master[["sku", "brand", "category", "SKU_Description"]].drop_duplicates(subset=["sku"])
-
-        compiled_df = pd.merge(unified_sales, sku_meta, on="sku", how="left")
-        compiled_df["brand"] = compiled_df["brand"].fillna("The Souled Store")
-        compiled_df["category"] = compiled_df["category"].fillna("General")
-    else:
-        compiled_df = unified_sales
-        compiled_df["brand"] = "The Souled Store"
-        compiled_df["category"] = "General"
-        compiled_df["SKU_Description"] = compiled_df["sku"]
-
-    compiled_df["sales"] = compiled_df["sales"].fillna(0.0)
-    compiled_df["month"] = compiled_df["date"].dt.month
-    compiled_df["is_weekend"] = compiled_df["date"].dt.dayofweek.isin([5, 6]).astype(int)
-
-    if "price" not in compiled_df.columns or compiled_df["price"].isnull().all():
-        price_tiers = np.array([499.0, 699.0, 799.0, 999.0, 1199.0, 1499.0])
-        sku_hashes = compiled_df["sku"].astype(str).apply(lambda s: abs(hash(s)) % len(price_tiers))
-        compiled_df["price"] = price_tiers[sku_hashes]
-    else:
-        compiled_df["price"] = pd.to_numeric(compiled_df["price"], errors="coerce").fillna(799.0)
-
-    compiled_df["revenue"] = compiled_df["sales"] * compiled_df["price"]
-    compiled_df.to_parquet(cache_file, index=False)
-    return compiled_df
-
-compiled_df = load_and_compile_data()
-
-# ==============================================================================
-# 3. Multi-Criteria ABC/XYZ SKU Classification Engine (@st.cache_data)
-# ==============================================================================
-@st.cache_data
-def compute_abc_classification(df: pd.DataFrame) -> dict:
-    """
-    Computes Pareto ranking using BOTH Total Revenue AND Total Unit Volume:
-      - Class A: SKUs in the top 80% cumulative revenue OR top 80% cumulative unit volume.
-      - Class B: SKUs in the next 15% cumulative revenue OR top 95% cumulative volume.
-      - Class C: SKUs in the bottom 5% of both revenue and volume.
-    Returns a dictionary mapping sku -> class string.
-    """
-    sku_stats = df.groupby("sku", as_index=False).agg({"revenue": "sum", "sales": "sum"})
-    tot_rev = float(sku_stats["revenue"].sum())
-    tot_vol = float(sku_stats["sales"].sum())
-
-    if tot_rev <= 0 or tot_vol <= 0:
-        return {s: "Class B" for s in sku_stats["sku"]}
-
-    sku_stats = sku_stats.sort_values(by="revenue", ascending=False)
-    sku_stats["cum_rev"] = sku_stats["revenue"].cumsum() / tot_rev
-
-    sku_stats = sku_stats.sort_values(by="sales", ascending=False)
-    sku_stats["cum_vol"] = sku_stats["sales"].cumsum() / tot_vol
-
-    def assign_multi_criteria_class(row) -> str:
-        if row["cum_rev"] <= 0.80 or row["cum_vol"] <= 0.80:
-            return "Class A"
-        elif row["cum_rev"] <= 0.95 or row["cum_vol"] <= 0.95:
-            return "Class B"
-        else:
-            return "Class C"
-
-    sku_stats["sku_class"] = sku_stats.apply(assign_multi_criteria_class, axis=1)
-    return dict(zip(sku_stats["sku"], sku_stats["sku_class"]))
-
-sku_class_map = compute_abc_classification(compiled_df)
-compiled_df["sku_class"] = compiled_df["sku"].map(sku_class_map).fillna("Class B")
 
 # ==============================================================================
 # Model Loader (@st.cache_resource)
@@ -268,6 +205,7 @@ def get_timesfm_model():
     return TimesFM3Forecaster.from_pretrained("google/timesfm-3.0-pytorch")
 
 timesfm_model = get_timesfm_model()
+
 
 # ==============================================================================
 # Model Core Execution Matrix: Algorithms
@@ -281,10 +219,8 @@ def train_and_forecast_xgboost(
     is_weekly: bool = False
 ) -> np.ndarray:
     """
-    Trains an XGBoost Regressor using month, weekend flag, weighted promotional covariates
-    (peak_event_flag and pre_event_flag), and lag/rolling average features.
-    Supports both Daily (1d, 7d, 14d lags) and Weekly (1w, 2w, 4w lags) series.
-    Recursive multi-step forecasting loop.
+    Trains an XGBoost Regressor using month, weekend flag, weighted promotional covariates,
+    and lag/rolling average features. Multi-threaded CPU execution.
     """
     df_sorted = context_df.sort_values("date").reset_index(drop=True)
     vals = df_sorted[target_col].values.astype(np.float32)
@@ -306,7 +242,7 @@ def train_and_forecast_xgboost(
         row_date = df_sorted["date"].iloc[i]
         feat = [
             row_date.month,
-            0 if is_weekly else int(row_date.dayofweek in [5, 6]),
+            0 if is_weekly else int(row_date.day_of_week in [5, 6]),
             float(peaks[i]),
             float(pres[i]),
             float(vals[i - lag_steps[0]]),
@@ -322,11 +258,11 @@ def train_and_forecast_xgboost(
     y_train = np.array(y_list, dtype=np.float32)
 
     reg = xgb.XGBRegressor(
-        n_estimators=50,
+        n_estimators=45,
         max_depth=4,
         learning_rate=0.08,
         random_state=42,
-        n_jobs=1
+        n_jobs=-1
     )
     reg.fit(X_train, y_train)
 
@@ -337,7 +273,7 @@ def train_and_forecast_xgboost(
         pre_val = float(future_pres[idx]) if idx < len(future_pres) else 0.0
         feat_vec = np.array([[
             f_date.month,
-            0 if is_weekly else int(f_date.dayofweek in [5, 6]),
+            0 if is_weekly else int(f_date.day_of_week in [5, 6]),
             peak_val,
             pre_val,
             float(curr_history[-lag_steps[0]]),
@@ -356,10 +292,6 @@ def train_and_forecast_xgboost(
 
 
 def check_discontinued(series: np.ndarray, threshold_days: int = 60) -> bool:
-    """
-    Zero-demand truncation check: returns True if SKU registered 0 sales for > threshold_days
-    consecutive periods immediately preceding the forecast cutoff/start date.
-    """
     non_zeros = np.where(series > 0)[0]
     if len(non_zeros) == 0:
         return True
@@ -373,12 +305,6 @@ def sba_croston_forecast(
     alpha: float = 0.1,
     is_discontinued: bool = False
 ) -> tuple:
-    """
-    Syntetos-Boylan Approximation (SBA) with Zero-Demand Truncation:
-    - Zero-Demand Truncation: If SKU is marked discontinued, sets baseline forecast to 0.0.
-    - SBA Bias Correction: Forecast_SBA = (1.0 - alpha / 2.0) * Forecast_Croston.
-    Returns: (forecast_array, sba_rate, demand_std)
-    """
     if is_discontinued:
         return np.zeros(horizon, dtype=np.float32), 0.0, 0.0
 
@@ -414,10 +340,6 @@ def compute_safety_stock_rop(
     is_discontinued: bool = False,
     is_weekly: bool = False
 ) -> tuple:
-    """
-    Computes Recommended Safety Stock Buffer and Reorder Point (ROP).
-    Z is derived from confidence interval using normal distribution quantile.
-    """
     if is_discontinued or rate <= 0:
         return 0, 0
 
@@ -436,13 +358,6 @@ def compute_safety_stock_rop(
 
 
 def compute_evaluation_metrics(actual, pred):
-    """
-    Computes enterprise validation and benchmark evaluation metrics:
-    - Validation Accuracy (%) = max(0.0, (1 - WAPE) * 100)
-    - WAPE = sum(|actual - pred|) / max(sum(actual), 1.0)
-    - MAE = mean(|actual - pred|)
-    - Total Projected = sum(pred)
-    """
     actual_f = np.asarray(actual, dtype=np.float32)
     pred_f = np.asarray(pred, dtype=np.float32)
     abs_err = np.abs(actual_f - pred_f)
@@ -454,12 +369,134 @@ def compute_evaluation_metrics(actual, pred):
     return acc_val, wape_val, mae_val, tot_pred
 
 
+# ==============================================================================
+# Cached Prediction Layer (Avoids Redundant Model Calls on UI interactions)
+# ==============================================================================
+@st.cache_data(show_spinner="Forecasting with Google TimesFM 3.0 & XGBoost...")
+def run_cached_live_models(
+    cache_key: str,
+    historical_array: np.ndarray,
+    future_dates: list,
+    future_peaks: np.ndarray,
+    future_pres: np.ndarray,
+    past_future_covariates: np.ndarray,
+    sku_dates: list,
+    sku_vals: np.ndarray,
+    sku_peaks: np.ndarray,
+    sku_pres: np.ndarray,
+    target_col: str,
+    horizon_steps: int,
+    base_modeling_grain: str,
+    is_class_c: bool,
+    is_discontinued: bool
+):
+    """Runs and caches TimesFM, XGBoost, and SBA Croston live projections."""
+    # 1. TimesFM 3.0 Foundation Model
+    tfm_out = timesfm_model.predict(
+        historical_array,
+        horizon=horizon_steps,
+        past_future_covariates=past_future_covariates,
+        padding_mode="edge",
+        return_quantiles=True
+    )
+    timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
+    quantiles_matrix = np.asarray(tfm_out.quantiles, dtype=np.float32)
+
+    # 2. XGBoost Multivariate Regressor
+    context_df = pd.DataFrame({
+        "date": sku_dates,
+        target_col: sku_vals,
+        "peak_event_flag": sku_peaks,
+        "pre_event_flag": sku_pres
+    })
+    xgb_pred = train_and_forecast_xgboost(
+        context_df, target_col, future_dates, future_peaks, future_pres,
+        is_weekly=(base_modeling_grain == "Weekly")
+    )
+
+    # 3. SBA Croston Intermittent
+    croston_pred, sba_rate, demand_std = sba_croston_forecast(
+        historical_array,
+        horizon=horizon_steps,
+        alpha=0.1,
+        is_discontinued=is_discontinued
+    )
+
+    if is_class_c and is_discontinued:
+        timesfm_pred = np.zeros(horizon_steps, dtype=np.float32)
+        quantiles_matrix = np.zeros_like(quantiles_matrix)
+        xgb_pred = np.zeros(horizon_steps, dtype=np.float32)
+        croston_pred = np.zeros(horizon_steps, dtype=np.float32)
+
+    return timesfm_pred, quantiles_matrix, xgb_pred, croston_pred, sba_rate, demand_std
+
+
+@st.cache_data(show_spinner="Running historical backtest benchmark...")
+def run_cached_validation_models(
+    cache_key: str,
+    context_array: np.ndarray,
+    past_future_covariates: np.ndarray,
+    context_dates: list,
+    context_vals: np.ndarray,
+    context_peaks: np.ndarray,
+    context_pres: np.ndarray,
+    truth_dates: list,
+    truth_peaks: np.ndarray,
+    truth_pres: np.ndarray,
+    target_col: str,
+    dynamic_horizon: int,
+    base_modeling_grain: str,
+    is_class_c: bool,
+    is_discontinued: bool
+):
+    """Runs and caches validation benchmark models."""
+    # 1. TimesFM 3.0
+    tfm_out = timesfm_model.predict(
+        context_array,
+        horizon=dynamic_horizon,
+        past_future_covariates=past_future_covariates,
+        padding_mode="edge",
+        return_quantiles=True
+    )
+    timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
+    quantiles_matrix = np.asarray(tfm_out.quantiles, dtype=np.float32)
+
+    # 2. XGBoost
+    context_df = pd.DataFrame({
+        "date": context_dates,
+        target_col: context_vals,
+        "peak_event_flag": context_peaks,
+        "pre_event_flag": context_pres
+    })
+    xgb_pred = train_and_forecast_xgboost(
+        context_df,
+        target_col,
+        truth_dates,
+        truth_peaks,
+        truth_pres,
+        is_weekly=(base_modeling_grain == "Weekly")
+    )
+
+    # 3. SBA Croston
+    croston_pred, sba_rate, demand_std = sba_croston_forecast(
+        context_array,
+        horizon=dynamic_horizon,
+        alpha=0.1,
+        is_discontinued=is_discontinued
+    )
+
+    if is_class_c and is_discontinued:
+        timesfm_pred = np.zeros(dynamic_horizon, dtype=np.float32)
+        quantiles_matrix = np.zeros_like(quantiles_matrix)
+        xgb_pred = np.zeros(dynamic_horizon, dtype=np.float32)
+        croston_pred = np.zeros(dynamic_horizon, dtype=np.float32)
+
+    return timesfm_pred, quantiles_matrix, xgb_pred, croston_pred, sba_rate, demand_std
+
+
 @st.cache_data(show_spinner=False)
 def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame:
-    """
-    Recalculates class-level macroeconomic backtesting benchmarks across the portfolio
-    dynamically for the selected validation cutoff date and target metric.
-    """
+    """Recalculates class-level benchmarks instantly using pre-aggregated daily class data."""
     c_dt = pd.to_datetime(cutoff_date)
     v_dt = pd.to_datetime("2025-12-31")
     col = "revenue" if metric_mode == "Expected Revenue" else "sales"
@@ -467,13 +504,15 @@ def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame
     sfx = "" if metric_mode == "Expected Revenue" else " units"
 
     configs = [
-        ("Class A Segment", "Class A", "Google TimesFM 3.0 (MLX) + Weighted Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
-        ("Class B Segment", "Class B", "Google TimesFM 3.0 (MLX)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
+        ("Class A Segment", "Class A", "Google TimesFM 3.0 (Torch) + Weighted Promo", "Daily", "Dynamic Neural Prediction & Promotional Replenishment"),
+        ("Class B Segment", "Class B", "Google TimesFM 3.0 (Torch)", "Weekly (W-MON)", "Weekly Aggregation to Eliminate High-Frequency Noise"),
         ("Class C Segment", "Class C", "SBA Intermittent Method (Syntetos-Boylan)", "Weekly (W-MON)", "Reorder Point (ROP) & Safety Stock Safeguards")
     ]
     out_rows = []
     for label, cls, engine, res, strat in configs:
-        sub = compiled_df[compiled_df["sku_class"] == cls].groupby("date")[[col]].sum().reset_index().sort_values("date")
+        sub = class_daily_df[class_daily_df["sku_class"] == cls][["date", col]].sort_values("date").copy()
+        if sub.empty:
+            continue
         f_timeline = pd.date_range(sub["date"].min(), sub["date"].max(), freq="D")
         sub = sub.set_index("date").reindex(f_timeline).rename_axis("date").reset_index()
         sub[col] = sub[col].fillna(0.0)
@@ -522,8 +561,9 @@ def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame
         })
     return pd.DataFrame(out_rows)
 
+
 # ==============================================================================
-# UI Control Panel: Sidebar (Hierarchical Drill-Down with Class Filter & ALL Defaults)
+# UI Control Panel: Sidebar (Fast Hierarchical Drill-Down)
 # ==============================================================================
 st.sidebar.subheader("Configuration Panel")
 
@@ -551,45 +591,75 @@ selected_class = st.sidebar.selectbox(
 )
 
 if selected_class == "ALL":
-    class_filtered_df = compiled_df
+    filtered_summary = sku_summary_df
 else:
-    class_filtered_df = compiled_df[compiled_df["sku_class"] == selected_class]
+    filtered_summary = sku_summary_df[sku_summary_df["sku_class"] == selected_class]
 
-brands_available = ["All"] + sorted(class_filtered_df["brand"].dropna().unique().tolist())
+brands_available = ["All"] + sorted(filtered_summary["brand"].dropna().unique().tolist())
 selected_brand = st.sidebar.selectbox("Brand Filter", brands_available, index=0)
 
 if selected_brand == "All":
-    cat_df = class_filtered_df
+    cat_summary = filtered_summary
 else:
-    cat_df = class_filtered_df[class_filtered_df["brand"] == selected_brand]
-categories_available = ["All"] + sorted(cat_df["category"].dropna().unique().tolist())
+    cat_summary = filtered_summary[filtered_summary["brand"] == selected_brand]
+
+categories_available = ["All"] + sorted(cat_summary["category"].dropna().unique().tolist())
 selected_category = st.sidebar.selectbox("Category Filter", categories_available, index=0)
 
 if selected_category == "All":
-    sku_df = cat_df
+    sku_pool = cat_summary
 else:
-    sku_df = cat_df[cat_df["category"] == selected_category]
+    sku_pool = cat_summary[cat_summary["category"] == selected_category]
 
-top_skus = sku_df.groupby("sku")["sales"].sum().sort_values(ascending=False).index.tolist()
-if not top_skus:
+total_matching = len(sku_pool)
+if total_matching == 0:
     st.warning("No SKU inventory records match the selected hierarchy.")
     st.stop()
 
-sku_options = ["All"] + top_skus
-sku_desc_map = dict(zip(sku_df["sku"], sku_df.get("SKU_Description", sku_df["sku"])))
+# Quick SKU search filter
+sku_search = st.sidebar.text_input(
+    "SKU Search / Filter",
+    "",
+    placeholder="Search by SKU or description...",
+    help="Instant filter to find any specific SKU without browser lag"
+).strip().lower()
 
+if sku_search:
+    s_mask = (
+        sku_pool["sku"].astype(str).str.lower().str.contains(sku_search, regex=False) |
+        sku_pool["SKU_Description"].astype(str).str.lower().str.contains(sku_search, regex=False)
+    )
+    active_pool = sku_pool[s_mask]
+else:
+    active_pool = sku_pool
+
+MAX_SELECT_ITEMS = 150
+top_skus = active_pool["sku"].tolist()[:MAX_SELECT_ITEMS]
+sku_options = ["All"] + top_skus
+
+pool_subset = active_pool.set_index("sku")
 def format_sku_label(sku_id: str) -> str:
     if sku_id == "All":
         if selected_class != "ALL":
-            return f"All {selected_class} SKUs ({len(top_skus):,} items) - {selected_class} Aggregate"
-        return f"All SKUs ({len(top_skus):,} items) - Portfolio Aggregate"
-    desc = str(sku_desc_map.get(sku_id, "") or "")
-    cls_tag = sku_class_map.get(sku_id, "Class B")
-    if desc and desc != "nan" and desc != sku_id:
-        return f"[{cls_tag}] {sku_id} - {desc[:30]}"
-    return f"[{cls_tag}] {sku_id}"
+            return f"All {selected_class} SKUs ({total_matching:,} items) - {selected_class} Aggregate"
+        return f"All SKUs ({total_matching:,} items) - Portfolio Aggregate"
+    try:
+        row = pool_subset.loc[sku_id]
+        desc = str(row["SKU_Description"] if "SKU_Description" in row else "")
+        cls_tag = str(row["sku_class"] if "sku_class" in row else "Class B")
+        if desc and desc != "nan" and desc != sku_id:
+            return f"[{cls_tag}] {sku_id} - {desc[:30]}"
+        return f"[{cls_tag}] {sku_id}"
+    except Exception:
+        return sku_id
 
 selected_sku = st.sidebar.selectbox("Active SKU Segment", sku_options, index=0, format_func=format_sku_label)
+
+if len(active_pool) > MAX_SELECT_ITEMS:
+    st.sidebar.caption(
+        f"Showing top {MAX_SELECT_ITEMS} of {len(active_pool):,} SKUs. "
+        "Use the search box above to instantly find any SKU."
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Horizon Calibration")
@@ -631,26 +701,36 @@ view_resolution = st.sidebar.radio(
 )
 
 # ==============================================================================
-# Data Preparation, Hierarchical Aggregation, and ABC Smart Strategy
+# Fast Data Preparation & Hierarchical Aggregation
 # ==============================================================================
 if selected_sku == "All":
-    active_sku_data = sku_df
     sku_class = f"{selected_class} Aggregate" if selected_class != "ALL" else "Portfolio Aggregate"
     sku_brand = selected_brand if selected_brand != "All" else "All Brands"
     sku_cat = selected_category if selected_category != "All" else "All Categories"
-    sku_desc = f"Consolidated {selected_class if selected_class != 'ALL' else 'Portfolio'} ({len(top_skus):,} Active SKUs)"
+    sku_desc = f"Consolidated {selected_class if selected_class != 'ALL' else 'Portfolio'} ({total_matching:,} Active SKUs)"
 
-    sku_daily = (
-        active_sku_data.groupby("date")[["sales", "revenue"]]
-        .sum()
-        .reset_index()
-        .sort_values("date")
-    )
+    if selected_brand == "All" and selected_category == "All":
+        # Instant precomputed daily aggregate!
+        sub_d = class_daily_df[class_daily_df["sku_class"] == selected_class].sort_values("date")
+        sku_daily = sub_d[["date", "sales", "revenue"]].copy()
+    else:
+        compiled_df = load_compiled_data()
+        sub_df = compiled_df
+        if selected_class != "ALL":
+            sub_df = sub_df[sub_df["sku_class"] == selected_class]
+        if selected_brand != "All":
+            sub_df = sub_df[sub_df["brand"] == selected_brand]
+        if selected_category != "All":
+            sub_df = sub_df[sub_df["category"] == selected_category]
+        sku_daily = sub_df.groupby("date")[["sales", "revenue"]].sum().reset_index().sort_values("date")
+
     tot_vol = float(sku_daily["sales"].sum())
     active_price = float(sku_daily["revenue"].sum() / tot_vol) if tot_vol > 0 else 799.0
     sku_daily["price"] = active_price
 else:
-    active_sku_data = sku_df[sku_df["sku"] == selected_sku]
+    # Specific SKU selected
+    compiled_df = load_compiled_data()
+    active_sku_data = compiled_df[compiled_df["sku"] == selected_sku]
     sku_class = sku_class_map.get(selected_sku, "Class B")
     meta_row = active_sku_data.iloc[0]
     sku_brand = meta_row.get("brand", "The Souled Store")
@@ -678,9 +758,9 @@ sku_daily["sales"] = sku_daily["sales"].fillna(0.0)
 sku_daily["revenue"] = sku_daily["revenue"].fillna(0.0)
 sku_daily["price"] = sku_daily["price"].fillna(active_price)
 sku_daily["month"] = sku_daily["date"].dt.month
-sku_daily["is_weekend"] = sku_daily["date"].dt.dayofweek.isin([5, 6]).astype(int)
+sku_daily["is_weekend"] = sku_daily["date"].dt.day_of_week.isin([5, 6]).astype(int)
 
-# Weighted promotional magnitude covariates (Daily)
+# Promotional magnitude covariates (Daily)
 d_peak, d_pre = generate_real_promo_covariate(sku_daily["date"])
 sku_daily["peak_event_flag"] = d_peak
 sku_daily["pre_event_flag"] = d_pre
@@ -765,7 +845,7 @@ low_idx = int(np.clip(np.argmin(np.abs(deciles - alpha_ci)), 0, 8))
 high_idx = int(np.clip(np.argmin(np.abs(deciles - (1.0 - alpha_ci))), 0, 8))
 
 # ==============================================================================
-# Model Execution Engine
+# Model Execution Engine (with High-Speed Caching)
 # ==============================================================================
 if dashboard_mode == "Live Future Forecast":
     historical_array = sku_series[target_col].values.astype(np.float32)
@@ -786,39 +866,28 @@ if dashboard_mode == "Live Future Forecast":
         np.concatenate([sku_series["pre_event_flag"].values.astype(np.float32), future_pres.astype(np.float32)])
     ])
 
-    with st.spinner(f"Computing multi-model projections for {horizon_steps} {base_modeling_grain.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Weighted Promo Covariates
-        tfm_out = timesfm_model.predict(
-            historical_array,
-            horizon=horizon_steps,
-            past_future_covariates=past_future_covariates,
-            padding_mode="edge",
-            return_quantiles=True
-        )
-        timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
-        quantiles_matrix = np.asarray(tfm_out.quantiles, dtype=np.float32)
-        tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
-        tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
+    live_cache_key = f"{selected_sku}_{selected_class}_{selected_brand}_{selected_category}_{target_col}_{horizon_steps}_{base_modeling_grain}_{is_discontinued}"
 
-        # 2. XGBoost Multivariate Regressor with Weighted Promo Covariates
-        xgb_pred = train_and_forecast_xgboost(
-            sku_series, target_col, future_dates, future_peaks, future_pres, is_weekly=(base_modeling_grain == "Weekly")
-        )
+    timesfm_pred, quantiles_matrix, xgb_pred, croston_pred, sba_rate, demand_std = run_cached_live_models(
+        cache_key=live_cache_key,
+        historical_array=historical_array,
+        future_dates=future_dates,
+        future_peaks=future_peaks,
+        future_pres=future_pres,
+        past_future_covariates=past_future_covariates,
+        sku_dates=list(sku_series["date"]),
+        sku_vals=sku_series[target_col].values.astype(np.float32),
+        sku_peaks=sku_series["peak_event_flag"].values.astype(np.float32),
+        sku_pres=sku_series["pre_event_flag"].values.astype(np.float32),
+        target_col=target_col,
+        horizon_steps=horizon_steps,
+        base_modeling_grain=base_modeling_grain,
+        is_class_c=is_class_c,
+        is_discontinued=is_discontinued
+    )
 
-        # 3. SBA Croston Intermittent with Zero-Demand Truncation
-        croston_pred, sba_rate, demand_std = sba_croston_forecast(
-            historical_array,
-            horizon=horizon_steps,
-            alpha=0.1,
-            is_discontinued=is_discontinued
-        )
-
-        if is_class_c and is_discontinued:
-            timesfm_pred = np.zeros(horizon_steps, dtype=np.float32)
-            tfm_lower = np.zeros(horizon_steps, dtype=np.float32)
-            tfm_upper = np.zeros(horizon_steps, dtype=np.float32)
-            xgb_pred = np.zeros(horizon_steps, dtype=np.float32)
-            croston_pred = np.zeros(horizon_steps, dtype=np.float32)
+    tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
+    tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
     # Base un-resampled future and history frames
     hist_frame = pd.DataFrame({"date": sku_series["date"], target_col: sku_series[target_col], "sales": sku_series["sales"]})
@@ -832,7 +901,7 @@ if dashboard_mode == "Live Future Forecast":
         "sales": timesfm_pred if view_mode == "Sales Units" else timesfm_pred / active_price
     })
 
-    # Option 2: Dynamic Portfolio Resolution Toggle
+    # Dynamic Portfolio Resolution Toggle
     if view_resolution != base_modeling_grain:
         plot_hist_df = resample_timeline(hist_frame, view_resolution)
         plot_future_df = resample_timeline(future_frame, view_resolution)
@@ -898,10 +967,7 @@ else:
         st.stop()
 
     context_array = context_df[target_col].values.astype(np.float32)
-    context_dates = context_df["date"].values
     truth_array = truth_df[target_col].values.astype(np.float32)
-    truth_dates = truth_df["date"].values
-
     dynamic_horizon = len(truth_df)
 
     past_future_covariates = np.stack([
@@ -909,44 +975,28 @@ else:
         np.concatenate([context_df["pre_event_flag"].values.astype(np.float32), truth_df["pre_event_flag"].values.astype(np.float32)])
     ])
 
-    with st.spinner(f"Executing validation benchmark across {dynamic_horizon} {base_modeling_grain.lower()} steps..."):
-        # 1. TimesFM 3.0 MLX Native Inference with Weighted Promo Covariates
-        tfm_out = timesfm_model.predict(
-            context_array,
-            horizon=dynamic_horizon,
-            past_future_covariates=past_future_covariates,
-            padding_mode="edge",
-            return_quantiles=True
-        )
-        timesfm_pred = np.asarray(tfm_out.forecast, dtype=np.float32)
-        quantiles_matrix = np.asarray(tfm_out.quantiles, dtype=np.float32)
-        tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
-        tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
+    val_cache_key = f"{selected_sku}_{selected_class}_{selected_brand}_{selected_category}_{target_col}_{cutoff_date_str}_{base_modeling_grain}_{is_discontinued}"
 
-        # 2. XGBoost Multivariate Regressor with Weighted Promo Covariates
-        xgb_pred = train_and_forecast_xgboost(
-            context_df,
-            target_col,
-            list(truth_df["date"]),
-            truth_df["peak_event_flag"].values.astype(np.float32),
-            truth_df["pre_event_flag"].values.astype(np.float32),
-            is_weekly=(base_modeling_grain == "Weekly")
-        )
+    timesfm_pred, quantiles_matrix, xgb_pred, croston_pred, sba_rate, demand_std = run_cached_validation_models(
+        cache_key=val_cache_key,
+        context_array=context_array,
+        past_future_covariates=past_future_covariates,
+        context_dates=list(context_df["date"]),
+        context_vals=context_df[target_col].values.astype(np.float32),
+        context_peaks=context_df["peak_event_flag"].values.astype(np.float32),
+        context_pres=context_df["pre_event_flag"].values.astype(np.float32),
+        truth_dates=list(truth_df["date"]),
+        truth_peaks=truth_df["peak_event_flag"].values.astype(np.float32),
+        truth_pres=truth_df["pre_event_flag"].values.astype(np.float32),
+        target_col=target_col,
+        dynamic_horizon=dynamic_horizon,
+        base_modeling_grain=base_modeling_grain,
+        is_class_c=is_class_c,
+        is_discontinued=is_discontinued
+    )
 
-        # 3. SBA Croston Intermittent with Zero-Demand Truncation
-        croston_pred, sba_rate, demand_std = sba_croston_forecast(
-            context_array,
-            horizon=dynamic_horizon,
-            alpha=0.1,
-            is_discontinued=is_discontinued
-        )
-
-        if is_class_c and is_discontinued:
-            timesfm_pred = np.zeros(dynamic_horizon, dtype=np.float32)
-            tfm_lower = np.zeros(dynamic_horizon, dtype=np.float32)
-            tfm_upper = np.zeros(dynamic_horizon, dtype=np.float32)
-            xgb_pred = np.zeros(dynamic_horizon, dtype=np.float32)
-            croston_pred = np.zeros(dynamic_horizon, dtype=np.float32)
+    tfm_lower = np.minimum(quantiles_matrix[:, low_idx], timesfm_pred)
+    tfm_upper = np.maximum(quantiles_matrix[:, high_idx], timesfm_pred)
 
     # Assemble base truth frame for dynamic view resolution
     base_context_frame = pd.DataFrame({"date": context_df["date"], target_col: context_df[target_col], "sales": context_df["sales"]})
@@ -961,7 +1011,7 @@ else:
         "sales": truth_df["sales"]
     })
 
-    # Option 2: Dynamic Portfolio Resolution Toggle
+    # Dynamic Portfolio Resolution Toggle
     if view_resolution != base_modeling_grain:
         plot_context_df = resample_timeline(base_context_frame, view_resolution)
         plot_truth_df = resample_timeline(base_truth_frame, view_resolution)
@@ -1026,7 +1076,7 @@ else:
 
     benchmark_data = [
         {
-            "Model Architecture": "Google TimesFM 3.0 (MLX Foundation Model)",
+            "Model Architecture": "Google TimesFM 3.0 (MLX/Torch Foundation Model)",
             "Validation Accuracy": f"{tfm_acc:.1f}%",
             "WAPE (Error Margin)": f"{tfm_wape * 100:.1f}%",
             "MAE": f"{curr_symbol}{tfm_mae:,.1f}{unit_suffix}",
