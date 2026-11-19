@@ -1,4 +1,4 @@
-# Enterprise Demand Intelligence Workspace
+# eRetail Demand Intelligence Workspace
 
 An enterprise-grade, multi-model demand intelligence, inventory optimization, and financial projection platform engineered for retail supply chains. Powered by Google TimesFM 3.0 Foundation Model, this workspace combines forecasting, segmentation, planning, and operational recommendations into a single interactive Streamlit application.
 

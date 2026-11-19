@@ -17,11 +17,11 @@ import xgboost as xgb
 # Streamlit Application Configuration
 # ==============================================================================
 st.set_page_config(
-    page_title="Enterprise Demand Intelligence Workspace",
+    page_title="eRetail Demand Intelligence Workspace",
     layout="wide"
 )
 
-st.title("Enterprise Demand Intelligence Workspace")
+st.title("eRetail Demand Intelligence Workspace")
 st.caption(
     "AI-powered multi-model time-series forecasting, financial projections, and "
     "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and SBA Intermittent Demand."

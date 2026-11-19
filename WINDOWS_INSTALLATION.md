@@ -1,7 +1,7 @@
 # Windows Installation & Execution Guide
 
 **Target System:** Microsoft Windows 10 / Windows 11 (64-bit)  
-**Project:** Enterprise Demand Intelligence Workspace (`eRetail-AI-Intelligence-3`)  
+**Project:** eRetail Demand Intelligence Workspace (`eRetail-AI-Intelligence-3`)  
 **Production Entry Point:** `app.py`  
 
 This guide provides exhaustive, step-by-step instructions for cloning, configuring, and executing the platform on a Windows workstation or server environment.

@@ -1,4 +1,4 @@
-# Enterprise Demand Intelligence Workspace: Technical Architecture & Pipeline Specification
+# eRetail Demand Intelligence Workspace: Technical Architecture & Pipeline Specification
 
 **Target Audience:** Chief Technology Officer (CTO), Head of Engineering, Principal Data Scientists, and Engineering Managers  
 **System Designation:** eRetail AI Intelligence 3 (`eRetail-AI-Intelligence-3`)  
@@ -11,7 +11,7 @@
 ## 1. Executive System Overview
 
 ### 1.1 Architectural Topology
-The Enterprise Demand Intelligence Workspace is a low-latency, real-time AI-powered forecasting and inventory optimization platform engineered for multi-echelon retail supply chains. The engine integrates deep foundation time-series neural networks, multivariate gradient-boosted decision trees, and statistical intermittent demand algorithms, orchestrating them dynamically based on SKU-level Pareto segmentation and promotional calendars.
+The eRetail Demand Intelligence Workspace is a low-latency, real-time AI-powered forecasting and inventory optimization platform engineered for multi-echelon retail supply chains. The engine integrates deep foundation time-series neural networks, multivariate gradient-boosted decision trees, and statistical intermittent demand algorithms, orchestrating them dynamically based on SKU-level Pareto segmentation and promotional calendars.
 
 ```
 +----------------------------------------------------------------------------------------------------+
