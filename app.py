@@ -21,11 +21,30 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("eRetail Demand Intelligence Workspace")
-st.caption(
-    "AI-powered multi-model time-series forecasting, financial projections, and "
-    "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and SBA Intermittent Demand."
-)
+# Initialize session state for SKU filter visibility
+if "show_sku_filter" not in st.session_state:
+    st.session_state["show_sku_filter"] = False
+
+# Header and Top Right 3-Dot Menu
+col_header_title, col_header_menu = st.columns([0.94, 0.06])
+with col_header_title:
+    st.title("eRetail Demand Intelligence Workspace")
+    st.caption(
+        "AI-powered multi-model time-series forecasting, financial projections, and "
+        "historical validation matrix benchmarking Google TimesFM 3.0 (MLX), XGBoost Multivariate, and SBA Intermittent Demand."
+    )
+with col_header_menu:
+    with st.popover("⋮", help="Dashboard View Options"):
+        st.markdown("**View Controls**")
+        toggle_sku = st.checkbox(
+            "Show Individual SKU Filter",
+            value=st.session_state["show_sku_filter"],
+            help="Show or hide the individual SKU selection dropdown in the sidebar.",
+            key="toggle_show_sku_filter"
+        )
+        if toggle_sku != st.session_state["show_sku_filter"]:
+            st.session_state["show_sku_filter"] = toggle_sku
+            st.rerun()
 
 # ==============================================================================
 # 1. Weighted Promotional Magnitude Covariates Engine (2023 - 2025)
@@ -696,40 +715,44 @@ if not top_skus:
 sku_desc_map = dict(zip(sku_df["sku"], sku_df.get("SKU_Description", sku_df["sku"])))
 sku_volume_map = dict(sku_df.groupby("sku")["sales"].sum())
 
-# Compute per-SKU accuracy ranking (cached on cutoff, resolution & filter hierarchy)
-ranking_cutoff = cutoff_date_str if cutoff_date_str else "2024-12-31"
-sku_accuracy_map = get_sku_accuracy_ranking(
-    _df=sku_df,
-    cutoff_date=ranking_cutoff,
-    resolution=view_resolution,
-    selected_class=selected_class,
-    selected_brand=selected_brand,
-    selected_category=selected_category
-)
+# Compute per-SKU accuracy ranking and show dropdown if unhidden via top-right 3-dot menu
+if st.session_state.get("show_sku_filter", False):
+    ranking_cutoff = cutoff_date_str if cutoff_date_str else "2024-12-31"
+    sku_accuracy_map = get_sku_accuracy_ranking(
+        _df=sku_df,
+        cutoff_date=ranking_cutoff,
+        resolution=view_resolution,
+        selected_class=selected_class,
+        selected_brand=selected_brand,
+        selected_category=selected_category
+    )
 
-# Sort individual SKUs in descending order of validation accuracy, with sales volume as secondary tie-breaker
-sorted_skus = sorted(
-    top_skus,
-    key=lambda s: (sku_accuracy_map.get(s, 0.0), sku_volume_map.get(s, 0.0)),
-    reverse=True
-)
+    # Sort individual SKUs in descending order of validation accuracy, with sales volume as secondary tie-breaker
+    sorted_skus = sorted(
+        top_skus,
+        key=lambda s: (sku_accuracy_map.get(s, 0.0), sku_volume_map.get(s, 0.0)),
+        reverse=True
+    )
 
-sku_options = ["All"] + sorted_skus
+    sku_options = ["All"] + sorted_skus
 
-def format_sku_label(sku_id: str) -> str:
-    if sku_id == "All":
-        if selected_class != "ALL":
-            return f"All {selected_class} SKUs ({len(top_skus):,} items) - {selected_class} Aggregate"
-        return f"All SKUs ({len(top_skus):,} items) - Portfolio Aggregate"
-    desc = str(sku_desc_map.get(sku_id, "") or "").strip()
-    cls_tag = sku_class_map.get(sku_id, "Class B")
-    acc_score = sku_accuracy_map.get(sku_id, 0.0)
-    acc_str = f"(Acc: {acc_score:.1f}%)"
-    if desc and desc != "nan" and desc != sku_id:
-        return f"[{cls_tag}] {sku_id} - {desc[:30]} {acc_str}"
-    return f"[{cls_tag}] {sku_id} {acc_str}"
+    def format_sku_label(sku_id: str) -> str:
+        if sku_id == "All":
+            if selected_class != "ALL":
+                return f"All {selected_class} SKUs ({len(top_skus):,} items) - {selected_class} Aggregate"
+            return f"All SKUs ({len(top_skus):,} items) - Portfolio Aggregate"
+        desc = str(sku_desc_map.get(sku_id, "") or "").strip()
+        cls_tag = sku_class_map.get(sku_id, "Class B")
+        acc_score = sku_accuracy_map.get(sku_id, 0.0)
+        acc_str = f"(Acc: {acc_score:.1f}%)"
+        if desc and desc != "nan" and desc != sku_id:
+            return f"[{cls_tag}] {sku_id} - {desc[:30]} {acc_str}"
+        return f"[{cls_tag}] {sku_id} {acc_str}"
 
-selected_sku = st.sidebar.selectbox("Active SKU Segment", sku_options, index=0, format_func=format_sku_label)
+    selected_sku = st.sidebar.selectbox("Active SKU Segment", sku_options, index=0, format_func=format_sku_label)
+else:
+    selected_sku = "All"
+    st.sidebar.caption("Individual SKU filter hidden (Showing All SKUs). To unhide, click the **⋮** menu in the top right.")
 
 # ==============================================================================
 # Data Preparation, Hierarchical Aggregation, and ABC Smart Strategy
