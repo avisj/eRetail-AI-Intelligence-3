@@ -455,6 +455,85 @@ def compute_evaluation_metrics(actual, pred):
 
 
 @st.cache_data(show_spinner=False)
+def get_sku_accuracy_ranking(
+    _df: pd.DataFrame,
+    cutoff_date: str,
+    resolution: str,
+    selected_class: str = "ALL",
+    selected_brand: str = "All",
+    selected_category: str = "All"
+) -> dict:
+    """
+    Computes per-SKU validation accuracy (1 - WAPE) * 100 for all SKUs in the filtered catalog
+    using high-throughput vectorized aggregation across the validation period.
+    Cached on (cutoff_date, resolution, selected_class, selected_brand, selected_category).
+    """
+    if _df.empty or "sku" not in _df.columns:
+        return {}
+
+    c_dt = pd.to_datetime(cutoff_date)
+    v_dt = pd.to_datetime("2025-12-31")
+
+    train_df = _df[_df["date"] <= c_dt]
+    if train_df.empty:
+        return {s: 0.0 for s in _df["sku"].unique()}
+
+    min_date = _df["date"].min()
+    total_train_days = max((c_dt - min_date).days + 1, 1)
+
+    # Historical baseline rate per SKU with 60-day discontinuation check
+    last_dates = train_df.groupby("sku")["date"].max()
+    train_sums = train_df.groupby("sku")["sales"].sum()
+    days_inactive = (c_dt - last_dates).dt.days
+    is_active = (days_inactive <= 60) & (train_sums > 0)
+    daily_rates = (train_sums / total_train_days).where(is_active, 0.0)
+
+    # Validation period actuals and aggregation by resolution
+    val_df = _df[(_df["date"] > c_dt) & (_df["date"] <= v_dt)]
+    freq = "W-MON" if "Weekly" in resolution else ("MS" if "Monthly" in resolution else "D")
+    days_per_period = 7.0 if freq == "W-MON" else (30.4 if freq == "MS" else 1.0)
+
+    full_val_dates = pd.date_range(c_dt + pd.Timedelta(days=1), v_dt, freq=freq)
+    n_periods = max(len(full_val_dates), 1)
+
+    if val_df.empty:
+        return {s: 0.0 for s in _df["sku"].unique()}
+
+    if freq == "D":
+        val_periods = val_df.groupby(["sku", "date"])["sales"].sum().reset_index()
+    else:
+        val_periods = val_df.groupby(["sku", pd.Grouper(key="date", freq=freq)])["sales"].sum().reset_index()
+
+    val_periods["rate"] = val_periods["sku"].map(daily_rates).fillna(0.0) * days_per_period
+    val_periods["abs_diff"] = (val_periods["sales"] - val_periods["rate"]).abs()
+
+    sku_val_stats = val_periods.groupby("sku").agg(
+        actual_sum=("sales", "sum"),
+        active_periods_diff=("abs_diff", "sum"),
+        active_periods_count=("abs_diff", "count")
+    )
+
+    sku_val_stats["rate"] = sku_val_stats.index.map(daily_rates).fillna(0.0) * days_per_period
+    sku_val_stats["zero_periods"] = np.maximum(0, n_periods - sku_val_stats["active_periods_count"])
+    sku_val_stats["total_abs_err"] = sku_val_stats["active_periods_diff"] + sku_val_stats["zero_periods"] * sku_val_stats["rate"]
+
+    act = sku_val_stats["actual_sum"].values
+    err = sku_val_stats["total_abs_err"].values
+    wape = err / np.maximum(act, 1.0)
+    acc = np.where(act >= 1.0, np.clip((1.0 - wape) * 100.0, 0.0, 100.0), 0.0)
+
+    acc_dict = {s: round(float(a), 1) for s, a in zip(sku_val_stats.index, acc)}
+
+    # Ensure all SKUs in filtered catalog are present in mapping
+    all_skus = _df["sku"].unique()
+    for s in all_skus:
+        if s not in acc_dict:
+            acc_dict[s] = 0.0
+
+    return acc_dict
+
+
+@st.cache_data(show_spinner=False)
 def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame:
     """
     Recalculates class-level macroeconomic backtesting benchmarks across the portfolio
@@ -523,7 +602,7 @@ def compute_class_benchmarks(cutoff_date: str, metric_mode: str) -> pd.DataFrame
     return pd.DataFrame(out_rows)
 
 # ==============================================================================
-# UI Control Panel: Sidebar (Hierarchical Drill-Down with Class Filter & ALL Defaults)
+# UI Control Panel: Sidebar (Configuration, Calibration & Hierarchical Drill-Down)
 # ==============================================================================
 st.sidebar.subheader("Configuration Panel")
 
@@ -537,6 +616,45 @@ dashboard_mode = st.sidebar.selectbox(
     "Operating Mode",
     ["Live Future Forecast", "Historical Validation (Backtesting)"],
     help="Select operational mode: forward projection or historical validation benchmarking."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Resolution Calibration")
+view_resolution = st.sidebar.radio(
+    "Aggregate View Resolution",
+    ["Daily", "Weekly (W-MON)", "Monthly (MS)"],
+    index=0,
+    help="Dynamically resample and aggregate demand time-series and multi-model forecasts."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Horizon Calibration")
+
+if dashboard_mode == "Live Future Forecast":
+    horizon_days = st.sidebar.slider(
+        "Forecast Horizon (Days)",
+        min_value=7,
+        max_value=180,
+        value=30,
+        step=1,
+        help="Number of future consecutive calendar days to project (up to 180 days)."
+    )
+    cutoff_date_str = None
+else:
+    cutoff_date_str = st.sidebar.selectbox(
+        "Validation Cutoff Date",
+        ["2024-12-31", "2025-06-30"],
+        help="Temporal validation boundary: data prior to cutoff trains models; data after represents ground truth."
+    )
+    horizon_days = None
+
+confidence_interval = st.sidebar.slider(
+    "Confidence Interval (%)",
+    min_value=50,
+    max_value=95,
+    value=80,
+    step=5,
+    help="Quantile interval band for uncertainty bounds and inventory safety stock."
 )
 
 st.sidebar.markdown("---")
@@ -575,60 +693,43 @@ if not top_skus:
     st.warning("No SKU inventory records match the selected hierarchy.")
     st.stop()
 
-sku_options = ["All"] + top_skus
 sku_desc_map = dict(zip(sku_df["sku"], sku_df.get("SKU_Description", sku_df["sku"])))
+sku_volume_map = dict(sku_df.groupby("sku")["sales"].sum())
+
+# Compute per-SKU accuracy ranking (cached on cutoff, resolution & filter hierarchy)
+ranking_cutoff = cutoff_date_str if cutoff_date_str else "2024-12-31"
+sku_accuracy_map = get_sku_accuracy_ranking(
+    _df=sku_df,
+    cutoff_date=ranking_cutoff,
+    resolution=view_resolution,
+    selected_class=selected_class,
+    selected_brand=selected_brand,
+    selected_category=selected_category
+)
+
+# Sort individual SKUs in descending order of validation accuracy, with sales volume as secondary tie-breaker
+sorted_skus = sorted(
+    top_skus,
+    key=lambda s: (sku_accuracy_map.get(s, 0.0), sku_volume_map.get(s, 0.0)),
+    reverse=True
+)
+
+sku_options = ["All"] + sorted_skus
 
 def format_sku_label(sku_id: str) -> str:
     if sku_id == "All":
         if selected_class != "ALL":
             return f"All {selected_class} SKUs ({len(top_skus):,} items) - {selected_class} Aggregate"
         return f"All SKUs ({len(top_skus):,} items) - Portfolio Aggregate"
-    desc = str(sku_desc_map.get(sku_id, "") or "")
+    desc = str(sku_desc_map.get(sku_id, "") or "").strip()
     cls_tag = sku_class_map.get(sku_id, "Class B")
+    acc_score = sku_accuracy_map.get(sku_id, 0.0)
+    acc_str = f"(Acc: {acc_score:.1f}%)"
     if desc and desc != "nan" and desc != sku_id:
-        return f"[{cls_tag}] {sku_id} - {desc[:30]}"
-    return f"[{cls_tag}] {sku_id}"
+        return f"[{cls_tag}] {sku_id} - {desc[:30]} {acc_str}"
+    return f"[{cls_tag}] {sku_id} {acc_str}"
 
 selected_sku = st.sidebar.selectbox("Active SKU Segment", sku_options, index=0, format_func=format_sku_label)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Horizon Calibration")
-
-if dashboard_mode == "Live Future Forecast":
-    horizon_days = st.sidebar.slider(
-        "Forecast Horizon (Days)",
-        min_value=7,
-        max_value=180,
-        value=30,
-        step=1,
-        help="Number of future consecutive calendar days to project (up to 180 days)."
-    )
-    cutoff_date_str = None
-else:
-    cutoff_date_str = st.sidebar.selectbox(
-        "Validation Cutoff Date",
-        ["2024-12-31", "2025-06-30"],
-        help="Temporal validation boundary: data prior to cutoff trains models; data after represents ground truth."
-    )
-    horizon_days = None
-
-confidence_interval = st.sidebar.slider(
-    "Confidence Interval (%)",
-    min_value=50,
-    max_value=95,
-    value=80,
-    step=5,
-    help="Quantile interval band for uncertainty bounds and inventory safety stock."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Resolution Calibration")
-view_resolution = st.sidebar.radio(
-    "Aggregate View Resolution",
-    ["Daily", "Weekly (W-MON)", "Monthly (MS)"],
-    index=0,
-    help="Dynamically resample and aggregate demand time-series and multi-model forecasts."
-)
 
 # ==============================================================================
 # Data Preparation, Hierarchical Aggregation, and ABC Smart Strategy

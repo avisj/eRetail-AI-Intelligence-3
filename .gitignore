@@ -31,3 +31,7 @@ sku_master2.csv
 # Task logs & scratch artifacts
 .system_generated/
 scratch/
+
+# Agent skills symlinks
+.agents/
+.claude/
